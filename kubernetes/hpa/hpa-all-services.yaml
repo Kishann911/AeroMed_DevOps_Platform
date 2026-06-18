@@ -1,0 +1,337 @@
+# =============================================================================
+# AeroMed — HorizontalPodAutoscalers for all 6 services
+#
+# Scale-up is fast (30s stabilization) to handle emergency call surges.
+# Scale-down is slow (300s stabilization) to avoid flapping and ensure
+# in-progress medical operations are never interrupted by pod termination.
+#
+# All HPAs target:
+#   CPU:    70% average utilization
+#   Memory: 400Mi average value
+#   Min: 2 replicas (HA floor — healthcare requires constant availability)
+#   Max: 10 replicas (autoscaling ceiling)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# API Gateway HPA
+# Handles all inbound traffic — first to scale under external load
+# ---------------------------------------------------------------------------
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway-hpa
+  namespace: aeromed-production
+  labels:
+    app: api-gateway
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Scales the API gateway during high-traffic dispatch events"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 400Mi
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30   # Fast — emergency surges need immediate capacity
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Slow — avoid flapping, protect in-flight requests
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# ---------------------------------------------------------------------------
+# Flight Operations HPA
+# Scales during multi-incident events when many flights are active
+# ---------------------------------------------------------------------------
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: flight-operations-hpa
+  namespace: aeromed-production
+  labels:
+    app: flight-operations
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Scales flight tracking during multi-aircraft simultaneous operations"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: flight-operations
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 400Mi
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# ---------------------------------------------------------------------------
+# Patient Records HPA
+# Scales during mass casualty incidents requiring many concurrent record reads
+# ---------------------------------------------------------------------------
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: patient-records-hpa
+  namespace: aeromed-production
+  labels:
+    app: patient-records
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Scales patient record access during mass casualty or multi-transport events"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: patient-records
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 400Mi
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# ---------------------------------------------------------------------------
+# Medical Equipment HPA
+# Scales during fleet-wide equipment status queries (pre-deployment checks)
+# ---------------------------------------------------------------------------
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: medical-equipment-hpa
+  namespace: aeromed-production
+  labels:
+    app: medical-equipment
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Scales equipment service during fleet-wide readiness checks"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: medical-equipment
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 400Mi
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# ---------------------------------------------------------------------------
+# Emergency Dispatch HPA
+# Most latency-sensitive service — scale-up must be near-instant for P1 events
+# ---------------------------------------------------------------------------
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: emergency-dispatch-hpa
+  namespace: aeromed-production
+  labels:
+    app: emergency-dispatch
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Scales dispatch coordination during simultaneous P1 emergency events"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: emergency-dispatch
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 400Mi
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30   # Fastest possible — P1 response time is critical
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 4             # Allow larger bursts for mass-casualty events
+          periodSeconds: 60
+        - type: Percent
+          value: 200
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# ---------------------------------------------------------------------------
+# Aircraft Communications HPA
+# Scales when many aircraft are simultaneously active and transmitting telemetry
+# ---------------------------------------------------------------------------
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: aircraft-comms-hpa
+  namespace: aeromed-production
+  labels:
+    app: aircraft-comms
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Scales telemetry processing when fleet size grows under surge conditions"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: aircraft-comms
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: AverageValue
+          averageValue: 400Mi
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Hold capacity — don't drop pods while aircraft are active
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120

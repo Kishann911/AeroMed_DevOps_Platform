@@ -1,0 +1,303 @@
+# =============================================================================
+# AeroMed DevOps Platform — Prometheus Configuration
+# Critical Care Air Ambulance Operations Monitoring
+#
+# Scrape topology:
+#   prometheus.yml     → static targets  (local dev / Docker Compose stack)
+#   targets/           → file_sd targets (environment-specific overrides)
+#   kubernetes_sd      → auto-discovers pods and nodes in the EKS cluster
+#
+# To reload config without restart (requires --web.enable-lifecycle):
+#   curl -X POST http://localhost:9090/-/reload
+# =============================================================================
+
+global:
+  scrape_interval:     15s   # Default poll frequency for all jobs
+  evaluation_interval: 15s   # How often recording/alert rules are evaluated
+  scrape_timeout:      10s   # Per-scrape HTTP timeout
+
+  # Labels added to every time series and alert produced by this Prometheus.
+  # Used in AlertManager routing, Grafana dashboards, and cross-cluster federation.
+  external_labels:
+    cluster:     aeromed-production
+    environment: production
+    region:      us-east-1
+    platform:    kubernetes
+
+# =============================================================================
+# Alerting — where to send firing alerts
+# =============================================================================
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - aeromed-alertmanager:9093   # Docker Compose / DNS name
+      scheme: http
+      timeout: 10s
+      api_version: v2
+
+  # Alert relabeling — strips internal Prometheus labels before sending to AlertManager
+  alert_relabel_configs:
+    - source_labels: [__address__]
+      target_label: alertmanager_address
+      action: replace
+
+# =============================================================================
+# Rule files — loaded in order; last write wins on label conflicts
+# =============================================================================
+rule_files:
+  - /etc/prometheus/rules/aeromed-alerts.yml
+  - /etc/prometheus/rules/recording-rules.yml
+  - /etc/prometheus/rules/kubernetes-alerts.yml
+
+# =============================================================================
+# Scrape configurations
+# =============================================================================
+scrape_configs:
+
+  # ---------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
+    metrics_path: /metrics
+    honor_labels: true
+
+  # ---------------------------------------------------------------------------
+  # AeroMed microservices — static targets (Docker Compose / local dev)
+  # For Kubernetes: see kubernetes-pods job below which auto-discovers via SD.
+  # ---------------------------------------------------------------------------
+  - job_name: aeromed-api-gateway
+    metrics_path: /metrics
+    scrape_interval: 10s    # Tighter interval — gateway is the health canary
+    static_configs:
+      - targets:
+          - aeromed-api-gateway:5000
+        labels:
+          service:      api-gateway
+          tier:         gateway
+          criticality:  high
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/aeromed-targets.yml
+        refresh_interval: 30s
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):.*'
+        target_label: instance
+        replacement: '$1'
+      - target_label: job
+        replacement: aeromed-api-gateway
+
+  - job_name: aeromed-flight-operations
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - aeromed-flight-operations:5001
+        labels:
+          service:      flight-operations
+          tier:         backend
+          criticality:  high
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):.*'
+        target_label: instance
+        replacement: '$1'
+
+  - job_name: aeromed-patient-records
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - aeromed-patient-records:5002
+        labels:
+          service:      patient-records
+          tier:         backend
+          criticality:  high
+          phi:          "true"    # Flag: contains PHI-adjacent metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):.*'
+        target_label: instance
+        replacement: '$1'
+
+  - job_name: aeromed-medical-equipment
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - aeromed-medical-equipment:5003
+        labels:
+          service:      medical-equipment
+          tier:         backend
+          criticality:  high
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):.*'
+        target_label: instance
+        replacement: '$1'
+
+  - job_name: aeromed-emergency-dispatch
+    metrics_path: /metrics
+    scrape_interval: 5s     # Fastest interval — dispatch latency is life-critical
+    static_configs:
+      - targets:
+          - aeromed-emergency-dispatch:5004
+        labels:
+          service:      emergency-dispatch
+          tier:         backend
+          criticality:  high
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):.*'
+        target_label: instance
+        replacement: '$1'
+
+  - job_name: aeromed-aircraft-comms
+    metrics_path: /metrics
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - aeromed-aircraft-comms:5005
+        labels:
+          service:      aircraft-comms
+          tier:         backend
+          criticality:  high
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):.*'
+        target_label: instance
+        replacement: '$1'
+
+  # ---------------------------------------------------------------------------
+  # Kubernetes pod auto-discovery
+  # Discovers pods annotated with prometheus.io/scrape: "true"
+  # and reads port/path from prometheus.io/port and prometheus.io/path.
+  # ---------------------------------------------------------------------------
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - aeromed-production
+            - aeromed-staging
+            - aeromed-monitoring
+
+    relabel_configs:
+      # Drop pods without the scrape annotation
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+
+      # Use the annotation-specified metrics path (default /metrics)
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+
+      # Use the annotation-specified port
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: '([^:]+)(?::\d+)?;(\d+)'
+        replacement: '$1:$2'
+        target_label: __address__
+
+      # Scheme (http/https)
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+        action: replace
+        target_label: __scheme__
+        regex: (.+)
+
+      # Preserve pod namespace as a label
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+
+      # Preserve pod name
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: kubernetes_pod_name
+
+      # Preserve pod labels as Prometheus labels (app, tier, criticality)
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+
+      # Node the pod is running on
+      - source_labels: [__meta_kubernetes_pod_node_name]
+        action: replace
+        target_label: node
+
+      # Drop Pending/Failed/Succeeded pods (only scrape Running)
+      - source_labels: [__meta_kubernetes_pod_phase]
+        action: keep
+        regex: Running
+
+  # ---------------------------------------------------------------------------
+  # Kubernetes node metrics (kubelet cadvisor)
+  # ---------------------------------------------------------------------------
+  - job_name: kubernetes-nodes
+    kubernetes_sd_configs:
+      - role: node
+
+    scheme: https
+    tls_config:
+      ca_file:   /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      insecure_skip_verify: false
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/$1/proxy/metrics
+
+    # Collect cadvisor container metrics from each node
+    metric_relabel_configs:
+      # Only keep aeromed-production container metrics (reduce cardinality)
+      - source_labels: [namespace]
+        action: keep
+        regex: 'aeromed-.*|kube-system'
+
+  # ---------------------------------------------------------------------------
+  # Kubernetes API server
+  # ---------------------------------------------------------------------------
+  - job_name: kubernetes-apiservers
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - default
+    scheme: https
+    tls_config:
+      ca_file:   /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name,
+                        __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: default;kubernetes;https
+
+  # ---------------------------------------------------------------------------
+  # AlertManager self-monitoring
+  # ---------------------------------------------------------------------------
+  - job_name: alertmanager
+    static_configs:
+      - targets:
+          - aeromed-alertmanager:9093
+    metrics_path: /metrics
+
+  # ---------------------------------------------------------------------------
+  # Grafana self-monitoring
+  # ---------------------------------------------------------------------------
+  - job_name: grafana
+    static_configs:
+      - targets:
+          - aeromed-grafana:3000
+    metrics_path: /metrics

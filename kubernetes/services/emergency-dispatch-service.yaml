@@ -1,0 +1,36 @@
+# =============================================================================
+# AeroMed — Emergency Dispatch Service (ClusterIP)
+# Internal-only — P1 dispatch coordination, never exposed without gateway auth
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: emergency-dispatch
+  namespace: aeromed-production
+  labels:
+    app: emergency-dispatch
+    tier: backend
+    criticality: high
+    app.kubernetes.io/name: emergency-dispatch
+    app.kubernetes.io/component: microservice
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "5004"
+    description: "Internal ClusterIP service for emergency dispatch coordination"
+spec:
+  type: ClusterIP
+  selector:
+    app: emergency-dispatch
+    tier: backend
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+  ports:
+    - name: http
+      port: 5004
+      targetPort: http
+      protocol: TCP

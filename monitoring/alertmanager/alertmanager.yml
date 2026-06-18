@@ -1,0 +1,132 @@
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alerts@aeromed.com'
+  smtp_auth_username: 'alerts@aeromed.com'
+  smtp_auth_password: 'REPLACE_WITH_SMTP_PASSWORD'
+  smtp_require_tls: true
+  slack_api_url: 'https://hooks.slack.com/services/PLACEHOLDER/PLACEHOLDER/PLACEHOLDER'
+
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+route:
+  receiver: aeromed-default
+  group_by: [alertname, service, severity]
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 1h
+
+  routes:
+    # Critical alerts: immediate notification, repeat every 5 minutes, continue to other receivers
+    - match:
+        severity: critical
+      receiver: aeromed-critical-ops
+      group_wait: 0s
+      repeat_interval: 5m
+      continue: true
+
+    # Aircraft communication loss: P1 — dedicated flight ops channel
+    - match:
+        alertname: AircraftCommunicationLost
+      receiver: aeromed-flight-ops-team
+      group_wait: 0s
+      repeat_interval: 5m
+
+    # Medical records unavailable: patient safety impact
+    - match:
+        alertname: MedicalRecordsServiceUnavailable
+      receiver: aeromed-medical-team
+      group_wait: 0s
+      repeat_interval: 10m
+
+    # Warning alerts: brief wait to de-duplicate before notifying devops
+    - match:
+        severity: warning
+      receiver: aeromed-devops-team
+      group_wait: 30s
+      repeat_interval: 2h
+
+receivers:
+  - name: aeromed-critical-ops
+    slack_configs:
+      - channel: '#aeromed-critical-alerts'
+        send_resolved: true
+        title: '{{ template "aeromed.critical.title" . }}'
+        text: '{{ template "aeromed.critical.text" . }}'
+        color: 'danger'
+        icon_emoji: ':rotating_light:'
+        username: 'AeroMed AlertManager'
+    email_configs:
+      - to: 'ops-critical@aeromed.com'
+        send_resolved: true
+        headers:
+          subject: '[CRITICAL] {{ .CommonAnnotations.summary }}'
+        html: '{{ template "aeromed.email.html" . }}'
+
+  - name: aeromed-flight-ops-team
+    slack_configs:
+      - channel: '#flight-operations'
+        send_resolved: true
+        title: '{{ template "aeromed.flight.title" . }}'
+        text: '{{ template "aeromed.flight.text" . }}'
+        color: 'warning'
+        icon_emoji: ':airplane:'
+        username: 'AeroMed AlertManager'
+    email_configs:
+      - to: 'flight-ops@aeromed.com'
+        send_resolved: true
+        headers:
+          subject: '[AIRCRAFT ALERT] {{ .CommonAnnotations.summary }}'
+        html: '{{ template "aeromed.email.html" . }}'
+
+  - name: aeromed-medical-team
+    slack_configs:
+      - channel: '#medical-ops'
+        send_resolved: true
+        title: '{{ template "aeromed.medical.title" . }}'
+        text: '{{ template "aeromed.medical.text" . }}'
+        color: 'danger'
+        icon_emoji: ':hospital:'
+        username: 'AeroMed AlertManager'
+    email_configs:
+      - to: 'medical-ops@aeromed.com'
+        send_resolved: true
+        headers:
+          subject: '[MEDICAL SYSTEM ALERT] {{ .CommonAnnotations.summary }}'
+        html: '{{ template "aeromed.email.html" . }}'
+
+  - name: aeromed-devops-team
+    slack_configs:
+      - channel: '#aeromed-devops'
+        send_resolved: true
+        title: '{{ template "aeromed.warning.title" . }}'
+        text: '{{ template "aeromed.warning.text" . }}'
+        color: 'warning'
+        icon_emoji: ':warning:'
+        username: 'AeroMed AlertManager'
+
+  - name: aeromed-default
+    slack_configs:
+      - channel: '#aeromed-monitoring'
+        send_resolved: true
+        title: '{{ template "aeromed.default.title" . }}'
+        text: '{{ template "aeromed.default.text" . }}'
+        color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+        icon_emoji: ':bell:'
+        username: 'AeroMed AlertManager'
+
+inhibit_rules:
+  # Suppress warning alerts for the same service/alert when a critical is already firing
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: [alertname, service]
+
+  # Suppress all service alerts if the full cluster is down
+  - source_match:
+      alertname: ClusterDown
+    target_match_re:
+      alertname: '.+'
+    equal: [namespace]

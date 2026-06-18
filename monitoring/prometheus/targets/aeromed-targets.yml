@@ -1,0 +1,175 @@
+# =============================================================================
+# AeroMed — File-based Service Discovery Targets
+#
+# This file is loaded via file_sd_configs in prometheus.yml.
+# Prometheus watches for changes and hot-reloads without restart
+# (no /-/reload curl required for file_sd changes).
+#
+# Use cases:
+#   - Docker Compose stack (local dev): containers on docker bridge network
+#   - Bare-metal or VM fallback: static IPs when K8s SD is unavailable
+#   - Additional external endpoints (hospital HIS systems, aircraft ground stations)
+#
+# Format: list of StaticConfig objects.
+#   labels are merged with any labels already on the scrape job.
+#   __address__ overrides the target address for that config entry.
+#
+# To apply changes: save this file — Prometheus reloads within 30s
+# (controlled by refresh_interval in file_sd_configs in prometheus.yml).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Docker Compose stack — local development targets
+# Container names resolve via Docker's internal DNS on the aeromed-network bridge.
+# ---------------------------------------------------------------------------
+
+- targets:
+    - "aeromed-api-gateway:5000"
+  labels:
+    job:          aeromed-api-gateway
+    environment:  development
+    deployment:   docker-compose
+    service:      api-gateway
+    tier:         gateway
+    criticality:  high
+
+- targets:
+    - "aeromed-flight-operations:5001"
+  labels:
+    job:          aeromed-flight-operations
+    environment:  development
+    deployment:   docker-compose
+    service:      flight-operations
+    tier:         backend
+    criticality:  high
+
+- targets:
+    - "aeromed-patient-records:5002"
+  labels:
+    job:          aeromed-patient-records
+    environment:  development
+    deployment:   docker-compose
+    service:      patient-records
+    tier:         backend
+    criticality:  high
+    phi:          "true"
+
+- targets:
+    - "aeromed-medical-equipment:5003"
+  labels:
+    job:          aeromed-medical-equipment
+    environment:  development
+    deployment:   docker-compose
+    service:      medical-equipment
+    tier:         backend
+    criticality:  high
+
+- targets:
+    - "aeromed-emergency-dispatch:5004"
+  labels:
+    job:          aeromed-emergency-dispatch
+    environment:  development
+    deployment:   docker-compose
+    service:      emergency-dispatch
+    tier:         backend
+    criticality:  high
+
+- targets:
+    - "aeromed-aircraft-comms:5005"
+  labels:
+    job:          aeromed-aircraft-comms
+    environment:  development
+    deployment:   docker-compose
+    service:      aircraft-comms
+    tier:         backend
+    criticality:  high
+
+# ---------------------------------------------------------------------------
+# Observability stack self-monitoring
+# ---------------------------------------------------------------------------
+
+- targets:
+    - "aeromed-prometheus:9090"
+  labels:
+    job:         prometheus
+    environment: development
+    deployment:  docker-compose
+    service:     prometheus
+
+- targets:
+    - "aeromed-grafana:3000"
+  labels:
+    job:         grafana
+    environment: development
+    deployment:  docker-compose
+    service:     grafana
+
+- targets:
+    - "aeromed-alertmanager:9093"
+  labels:
+    job:         alertmanager
+    environment: development
+    deployment:  docker-compose
+    service:     alertmanager
+
+# ---------------------------------------------------------------------------
+# Kubernetes production targets (used when Prometheus is deployed inside EKS
+# but kubernetes_sd_configs is not available or explicitly disabled).
+# In normal operation these are discovered via kubernetes_sd_configs in
+# prometheus.yml — only enable these as fallback by removing the # prefix.
+# ---------------------------------------------------------------------------
+
+# - targets:
+#     - "flight-operations.aeromed-production.svc.cluster.local:5001"
+#   labels:
+#     job:          aeromed-flight-operations
+#     environment:  production
+#     deployment:   kubernetes
+#     service:      flight-operations
+#     namespace:    aeromed-production
+
+# - targets:
+#     - "patient-records.aeromed-production.svc.cluster.local:5002"
+#   labels:
+#     job:          aeromed-patient-records
+#     environment:  production
+#     deployment:   kubernetes
+#     service:      patient-records
+#     namespace:    aeromed-production
+#     phi:          "true"
+
+# - targets:
+#     - "medical-equipment.aeromed-production.svc.cluster.local:5003"
+#   labels:
+#     job:          aeromed-medical-equipment
+#     environment:  production
+#     deployment:   kubernetes
+#     service:      medical-equipment
+#     namespace:    aeromed-production
+
+# - targets:
+#     - "emergency-dispatch.aeromed-production.svc.cluster.local:5004"
+#   labels:
+#     job:          aeromed-emergency-dispatch
+#     environment:  production
+#     deployment:   kubernetes
+#     service:      emergency-dispatch
+#     namespace:    aeromed-production
+
+# - targets:
+#     - "aircraft-comms.aeromed-production.svc.cluster.local:5005"
+#   labels:
+#     job:          aeromed-aircraft-comms
+#     environment:  production
+#     deployment:   kubernetes
+#     service:      aircraft-comms
+#     namespace:    aeromed-production
+
+# - targets:
+#     - "api-gateway.aeromed-production.svc.cluster.local:5000"
+#   labels:
+#     job:          aeromed-api-gateway
+#     environment:  production
+#     deployment:   kubernetes
+#     service:      api-gateway
+#     namespace:    aeromed-production

@@ -1,0 +1,191 @@
+# =============================================================================
+# AeroMed — RBAC Configuration
+#
+# Principle of least privilege — every rule is the minimum needed.
+# Audit log: any change to this file must be reviewed by security team.
+#
+# Resources defined:
+#   1. ServiceAccount  — aeromed-service-account (namespace-scoped)
+#   2. Role            — aeromed-role (read-only pod/service/configmap access)
+#   3. ClusterRole     — aeromed-monitoring-role (node + namespace visibility)
+#   4. RoleBinding     — binds aeromed-role to the ServiceAccount
+#   5. ClusterRoleBinding — binds aeromed-monitoring-role to the ServiceAccount
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. ServiceAccount
+# All AeroMed pods run under this account — avoids using the default SA
+# which may have excessive permissions in some cluster configurations.
+# ---------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aeromed-service-account
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: aeromed-service-account
+    app.kubernetes.io/part-of: aeromed-platform
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    description: "Dedicated service account for all AeroMed microservice pods"
+    # For IRSA (IAM Roles for Service Accounts on EKS):
+    # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/aeromed-eks-pod-role
+automountServiceAccountToken: false   # Opt-in per pod to minimize token exposure
+
+# ---------------------------------------------------------------------------
+# 2. Role — namespace-scoped read access
+# Services need to discover peers (list pods/services) and read their own config.
+# No write access — pods cannot modify cluster state.
+# ---------------------------------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aeromed-role
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: aeromed-role
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Namespace-scoped read-only access for AeroMed service pods"
+rules:
+  # Pods — services read their own pod info for health aggregation and self-labelling
+  - apiGroups: [""]
+    resources: ["pods", "pods/status"]
+    verbs: ["get", "list", "watch"]
+
+  # Services — required for in-cluster service discovery
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+
+  # ConfigMaps — services re-read aeromed-config at runtime without restart
+  # Restricted to aeromed-config only — cannot read other ConfigMaps
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+    resourceNames: ["aeromed-config"]
+
+  # Events — write-only for publishing application health events to the API server
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+# ---------------------------------------------------------------------------
+# 3. ClusterRole — monitoring visibility across the cluster
+# Prometheus and health aggregation need node metrics and namespace listing.
+# Read-only and narrowly scoped — no pod exec, no secrets, no write access.
+# ---------------------------------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aeromed-monitoring-role
+  labels:
+    app.kubernetes.io/name: aeromed-monitoring-role
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Cluster-wide read access for AeroMed monitoring and health aggregation"
+rules:
+  # Nodes — Prometheus node-exporter and cluster capacity dashboards
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/metrics", "nodes/stats", "nodes/proxy"]
+    verbs: ["get", "list", "watch"]
+
+  # Namespaces — api-gateway /api/all-status needs to verify namespace health
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+
+  # Non-namespaced metrics endpoint (Prometheus scrape of /metrics on nodes)
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+    verbs: ["get"]
+
+  # PersistentVolumes — capacity monitoring (storage for StatefulSets if added)
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+
+# ---------------------------------------------------------------------------
+# 4. RoleBinding — attaches aeromed-role to the ServiceAccount (namespace only)
+# ---------------------------------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aeromed-role-binding
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: aeromed-role-binding
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Binds aeromed-role to aeromed-service-account in aeromed-production"
+subjects:
+  - kind: ServiceAccount
+    name: aeromed-service-account
+    namespace: aeromed-production
+roleRef:
+  kind: Role
+  name: aeromed-role
+  apiGroup: rbac.authorization.k8s.io
+
+# ---------------------------------------------------------------------------
+# 5. ClusterRoleBinding — attaches aeromed-monitoring-role cluster-wide
+# ---------------------------------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aeromed-monitoring-role-binding
+  labels:
+    app.kubernetes.io/name: aeromed-monitoring-role-binding
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Grants aeromed-service-account cluster-wide monitoring read access"
+subjects:
+  - kind: ServiceAccount
+    name: aeromed-service-account
+    namespace: aeromed-production
+roleRef:
+  kind: ClusterRole
+  name: aeromed-monitoring-role
+  apiGroup: rbac.authorization.k8s.io
+
+# ---------------------------------------------------------------------------
+# 6. Role — aeromed-monitoring namespace
+# Prometheus pods in aeromed-monitoring need to scrape pods in other namespaces.
+# ---------------------------------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aeromed-prometheus-scrape-role
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: aeromed-prometheus-scrape-role
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Allows Prometheus in aeromed-monitoring to scrape aeromed-production pods"
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aeromed-prometheus-scrape-binding
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: aeromed-prometheus-scrape-binding
+    app.kubernetes.io/part-of: aeromed-platform
+subjects:
+  - kind: ServiceAccount
+    name: prometheus               # ServiceAccount used by Prometheus in its namespace
+    namespace: aeromed-monitoring
+roleRef:
+  kind: Role
+  name: aeromed-prometheus-scrape-role
+  apiGroup: rbac.authorization.k8s.io

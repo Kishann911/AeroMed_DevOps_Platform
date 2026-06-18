@@ -1,0 +1,15 @@
+apiVersion: 1
+
+providers:
+
+  - name: AeroMed Dashboards
+    type: file
+    orgId: 1
+    folder: AeroMed
+    folderUid: aeromed-dashboards
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

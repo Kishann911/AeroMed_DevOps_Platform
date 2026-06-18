@@ -1,0 +1,208 @@
+// =============================================================================
+// AeroMed — Medical Equipment Service Pipeline
+// Tracks ventilators, defibrillators, IV pumps, battery levels
+// =============================================================================
+
+@Library('aeromed-shared-lib') _
+
+pipeline {
+
+    agent any
+
+    environment {
+        SERVICE           = "medical-equipment"
+        SERVICE_PORT      = "5003"
+        REGISTRY          = "aeromed"
+        K8S_NAMESPACE_STG = "aeromed-staging"
+        K8S_NAMESPACE_PRD = "aeromed-production"
+        KUBE_CONFIG       = credentials('kubeconfig')
+        PIPELINE_START_MS = "${System.currentTimeMillis()}"
+        FAILED_STAGE      = ""
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['staging', 'production'])
+        booleanParam(name: 'SKIP_TESTS',  defaultValue: false)
+        booleanParam(name: 'ROLLBACK',    defaultValue: false)
+        string(name: 'PREVIOUS_VERSION',  defaultValue: '')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Checkout'
+                    checkout scm
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    echo "Building ${SERVICE} #${env.BUILD_NUMBER} | Commit: ${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        stage('Pre-flight Checks') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Pre-flight Checks'
+                    sh "docker info > /dev/null 2>&1"
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        sh "kubectl cluster-info --request-timeout=10s"
+                    }
+                    // Medical equipment check: warn if any equipment is in-use on active flights
+                    def eqStatus = sh(
+                        script: "curl -sf http://aeromed-medical-equipment:${SERVICE_PORT}/api/status 2>/dev/null || echo '{\"in_use_count\":0}'",
+                        returnStdout: true
+                    ).trim()
+                    def data = readJSON(text: eqStatus)
+                    def inUse = (data.in_use_count ?: 0) as int
+                    if (inUse > 0) {
+                        echo "⚠️  ${inUse} equipment item(s) currently in-use on active transports — deploy will proceed (service is stateless)"
+                    }
+                    echo "✅ Pre-flight checks passed"
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Build'
+                    aeromedBuild.buildImage(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Security Scan'
+                    aeromedBuild.runSecurityScan("${REGISTRY}/${SERVICE}:${env.BUILD_NUMBER}")
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Unit Tests'
+                    aeromedBuild.runUnitTests(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Integration Tests'
+                    aeromedBuild.runIntegrationTests([SERVICE])
+                }
+            }
+            post {
+                always { script { aeromedBuild.teardownIntegrationTests() } }
+            }
+        }
+
+        stage('Push') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Push'
+                    withCredentials([usernamePassword(credentialsId: 'docker-registry-creds',
+                                                      usernameVariable: 'DOCKER_USER',
+                                                      passwordVariable: 'DOCKER_PASS')]) {
+                        sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                    }
+                    aeromedBuild.pushImage(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                    sh "docker logout"
+                }
+            }
+        }
+
+        stage('Deploy → Staging') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy → Staging'
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy(SERVICE, K8S_NAMESPACE_STG, env.BUILD_NUMBER)
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Test (Staging)') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Smoke Test (Staging)'
+                    aeromedDeploy.verifyServiceHealth("http://aeromed-medical-equipment-staging:${SERVICE_PORT}")
+                    // Verify equipment types are returned correctly
+                    sh """
+                        curl -sf http://aeromed-medical-equipment-staging:${SERVICE_PORT}/api/status \
+                            | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert 'equipment' in d, 'Missing equipment list'
+types = {e['equipment_type'] for e in d['equipment']}
+print(f'  ✓ Equipment types present: {types}')
+"
+                    """
+                }
+            }
+        }
+
+        stage('Deploy → Production') {
+            when { expression { params.ENVIRONMENT == 'production' } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy → Production'
+                    aeromedNotify.stagingApprovalGate(SERVICE, env.BUILD_NUMBER)
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "Deploy medical-equipment #${env.BUILD_NUMBER} to production?",
+                              ok: '🚀 Deploy', submitter: 'aeromed-lead,aeromed-ops'
+                    }
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy(SERVICE, K8S_NAMESPACE_PRD, env.BUILD_NUMBER)
+                    }
+                }
+            }
+        }
+
+        stage('Verify') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Verify'
+                    def ns = params.ENVIRONMENT == 'production' ? K8S_NAMESPACE_PRD : K8S_NAMESPACE_STG
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.verifyPostDeployState(SERVICE, ns)
+                    }
+                    aeromedNotify.deploymentSummary(SERVICE, ns, env.BUILD_NUMBER, env.PIPELINE_START_MS as long)
+                }
+            }
+        }
+    }
+
+    post {
+        success { script { aeromedNotify.success(SERVICE, env.BUILD_NUMBER) } }
+        failure {
+            script {
+                aeromedNotify.failure(SERVICE, env.FAILED_STAGE, env.BUILD_NUMBER)
+                if (params.ROLLBACK) {
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.rollbackDeployment(SERVICE, K8S_NAMESPACE_PRD, params.PREVIOUS_VERSION ?: null)
+                    }
+                }
+            }
+        }
+        always {
+            junit allowEmptyResults: true, testResults: '**/test-results.xml'
+            cleanWs(cleanWhenSuccess: true, cleanWhenFailure: false, deleteDirs: true)
+        }
+    }
+}

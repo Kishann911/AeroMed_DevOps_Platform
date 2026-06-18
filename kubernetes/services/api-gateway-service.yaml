@@ -1,0 +1,53 @@
+# =============================================================================
+# AeroMed — API Gateway Service (LoadBalancer)
+# The ONLY externally-exposed service in the platform.
+# All other services are ClusterIP and unreachable from outside the cluster.
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: aeromed-production
+  labels:
+    app: api-gateway
+    tier: gateway
+    criticality: high
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "5000"
+    description: "External LoadBalancer — sole public entry point for the AeroMed platform"
+    # AWS-specific annotations for NLB (Network Load Balancer)
+    # NLB preferred over ALB here for lower latency on critical healthcare traffic
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-connection-draining-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-connection-draining-timeout: "60"
+    # Enable access logging to S3
+    service.beta.kubernetes.io/aws-load-balancer-access-log-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-name: "aeromed-nlb-access-logs"
+    service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-prefix: "api-gateway"
+spec:
+  type: LoadBalancer
+  selector:
+    app: api-gateway
+    tier: gateway
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600    # 1 hour — important for dispatch console sessions
+  externalTrafficPolicy: Local  # Preserves client source IP, avoids double-hop
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: http
+      protocol: TCP

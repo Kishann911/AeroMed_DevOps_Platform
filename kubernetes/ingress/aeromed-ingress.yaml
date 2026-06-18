@@ -1,0 +1,170 @@
+# =============================================================================
+# AeroMed — NGINX Ingress
+#
+# Routing strategy:
+#   Specific service paths are routed directly to their backends (bypassing
+#   the API gateway) for lower latency on internal integrations.
+#   The catch-all / routes to the API gateway for all consumer traffic.
+#
+# Path rewriting: /api/flights(/|$)(.*) → /$2 so the backend sees its own
+# path structure (/health, /api/status, /metrics) unchanged.
+#
+# For production: replace aeromed.local with your actual domain and use
+# cert-manager (Let's Encrypt) or ACM instead of the self-signed TLS secret.
+# =============================================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aeromed-ingress
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: aeromed-ingress
+    app.kubernetes.io/part-of: aeromed-platform
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    # ---------------------------------------------------------------------------
+    # Ingress class
+    # ---------------------------------------------------------------------------
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ingress.class: nginx
+
+    # ---------------------------------------------------------------------------
+    # TLS / Security
+    # ---------------------------------------------------------------------------
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/ssl-passthrough: "false"
+
+    # HSTS — browsers remember HTTPS-only for 1 year
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+      add_header X-Frame-Options "DENY" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # ---------------------------------------------------------------------------
+    # Rate limiting — protect against DoS on healthcare-critical endpoints
+    # 100 requests per minute per client IP
+    # ---------------------------------------------------------------------------
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+
+    # ---------------------------------------------------------------------------
+    # Timeouts — extended for medical operations (long-running dispatch queries)
+    # ---------------------------------------------------------------------------
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+
+    # ---------------------------------------------------------------------------
+    # Path rewriting — strip the service-specific prefix before forwarding
+    # e.g. /api/flights/api/status → /api/status on the flight-operations pod
+    # ---------------------------------------------------------------------------
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+
+    # ---------------------------------------------------------------------------
+    # Upstream settings
+    # ---------------------------------------------------------------------------
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "128k"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"  # Consistent routing per client
+
+    # ---------------------------------------------------------------------------
+    # Observability
+    # ---------------------------------------------------------------------------
+    nginx.ingress.kubernetes.io/enable-access-log: "true"
+    nginx.ingress.kubernetes.io/enable-opentelemetry: "true"
+
+spec:
+  ingressClassName: nginx
+
+  # ---------------------------------------------------------------------------
+  # TLS — aeromed.local self-signed for local dev
+  # Production: replace secret with cert-manager-issued cert
+  # ---------------------------------------------------------------------------
+  tls:
+    - hosts:
+        - aeromed.local
+      secretName: aeromed-tls
+
+  rules:
+    - host: aeromed.local
+      http:
+        paths:
+
+          # ------------------------------------------------------------------
+          # Flight Operations — /api/flights/*
+          # Handles active flight tracking, ETAs, aircraft positions
+          # ------------------------------------------------------------------
+          - path: /api/flights(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: flight-operations
+                port:
+                  number: 5001
+
+          # ------------------------------------------------------------------
+          # Patient Records — /api/patients/*
+          # PHI endpoint — additional auth middleware recommended upstream
+          # ------------------------------------------------------------------
+          - path: /api/patients(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: patient-records
+                port:
+                  number: 5002
+
+          # ------------------------------------------------------------------
+          # Medical Equipment — /api/equipment/*
+          # Equipment inventory, battery levels, maintenance status
+          # ------------------------------------------------------------------
+          - path: /api/equipment(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: medical-equipment
+                port:
+                  number: 5003
+
+          # ------------------------------------------------------------------
+          # Emergency Dispatch — /api/dispatch/*
+          # P1/P2/P3 dispatch events — lowest acceptable latency path
+          # ------------------------------------------------------------------
+          - path: /api/dispatch(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: emergency-dispatch
+                port:
+                  number: 5004
+
+          # ------------------------------------------------------------------
+          # Aircraft Communications — /api/comms/*
+          # Telemetry data, signal strength, GPS positions
+          # ------------------------------------------------------------------
+          - path: /api/comms(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: aircraft-comms
+                port:
+                  number: 5005
+
+          # ------------------------------------------------------------------
+          # API Gateway — / (catch-all)
+          # Handles: /api/all-status, /simulate/failure, proxied requests,
+          # and any path not matched by the specific routes above.
+          # MUST be last — nginx evaluates paths longest-match first.
+          # ------------------------------------------------------------------
+          - path: /(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 5000

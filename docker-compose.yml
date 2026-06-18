@@ -1,0 +1,267 @@
+version: "3.9"
+
+# =============================================================================
+# AeroMed DevOps Platform — Local Development Stack
+# =============================================================================
+
+networks:
+  aeromed-network:
+    driver: bridge
+
+volumes:
+  jenkins_home:
+  grafana_storage:
+  prometheus_data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # AeroMed Microservices
+  # ---------------------------------------------------------------------------
+
+  flight-operations:
+    build:
+      context: ./services/flight-operations
+    container_name: aeromed-flight-operations
+    ports:
+      - "5001:5001"
+    environment:
+      SERVICE_NAME: flight-operations
+      ENV: development
+      LOG_LEVEL: INFO
+      PORT: "5001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    labels:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/metrics"
+      prometheus.io/port: "5001"
+
+  patient-records:
+    build:
+      context: ./services/patient-records
+    container_name: aeromed-patient-records
+    ports:
+      - "5002:5002"
+    environment:
+      SERVICE_NAME: patient-records
+      ENV: development
+      LOG_LEVEL: INFO
+      PORT: "5002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5002/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    labels:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/metrics"
+      prometheus.io/port: "5002"
+
+  medical-equipment:
+    build:
+      context: ./services/medical-equipment
+    container_name: aeromed-medical-equipment
+    ports:
+      - "5003:5003"
+    environment:
+      SERVICE_NAME: medical-equipment
+      ENV: development
+      LOG_LEVEL: INFO
+      PORT: "5003"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5003/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    labels:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/metrics"
+      prometheus.io/port: "5003"
+
+  emergency-dispatch:
+    build:
+      context: ./services/emergency-dispatch
+    container_name: aeromed-emergency-dispatch
+    ports:
+      - "5004:5004"
+    environment:
+      SERVICE_NAME: emergency-dispatch
+      ENV: development
+      LOG_LEVEL: INFO
+      PORT: "5004"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5004/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    labels:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/metrics"
+      prometheus.io/port: "5004"
+
+  aircraft-comms:
+    build:
+      context: ./services/aircraft-comms
+    container_name: aeromed-aircraft-comms
+    ports:
+      - "5005:5005"
+    environment:
+      SERVICE_NAME: aircraft-comms
+      ENV: development
+      LOG_LEVEL: INFO
+      PORT: "5005"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5005/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    labels:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/metrics"
+      prometheus.io/port: "5005"
+
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+    container_name: aeromed-api-gateway
+    ports:
+      - "5050:5000"
+    environment:
+      SERVICE_NAME: api-gateway
+      ENV: development
+      LOG_LEVEL: INFO
+      PORT: "5000"
+      FLIGHT_OPS_URL: http://aeromed-flight-operations:5001
+      PATIENT_RECORDS_URL: http://aeromed-patient-records:5002
+      MEDICAL_EQUIPMENT_URL: http://aeromed-medical-equipment:5003
+      EMERGENCY_DISPATCH_URL: http://aeromed-emergency-dispatch:5004
+      AIRCRAFT_COMMS_URL: http://aeromed-aircraft-comms:5005
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    depends_on:
+      flight-operations:
+        condition: service_started
+      patient-records:
+        condition: service_started
+      medical-equipment:
+        condition: service_started
+      emergency-dispatch:
+        condition: service_started
+      aircraft-comms:
+        condition: service_started
+    labels:
+      prometheus.io/scrape: "true"
+      prometheus.io/path: "/metrics"
+      prometheus.io/port: "5000"
+
+  # ---------------------------------------------------------------------------
+  # Observability Stack
+  # ---------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aeromed-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
+      - --storage.tsdb.retention.time=15d
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    depends_on:
+      - flight-operations
+      - patient-records
+      - medical-equipment
+      - emergency-dispatch
+      - aircraft-comms
+      - api-gateway
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aeromed-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: aeromed123
+      GF_SECURITY_ADMIN_USER: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3000
+    volumes:
+      - grafana_storage:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+    depends_on:
+      - prometheus
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: aeromed-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --web.external-url=http://localhost:9093
+    restart: unless-stopped
+    networks:
+      - aeromed-network
+
+  # ---------------------------------------------------------------------------
+  # CI/CD
+  # ---------------------------------------------------------------------------
+
+  jenkins:
+    image: jenkins/jenkins:lts
+    container_name: aeromed-jenkins
+    user: root
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+    restart: unless-stopped
+    networks:
+      - aeromed-network

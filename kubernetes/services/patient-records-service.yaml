@@ -1,0 +1,36 @@
+# =============================================================================
+# AeroMed — Patient Records Service (ClusterIP)
+# Internal-only — PHI data, never exposed externally
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: patient-records
+  namespace: aeromed-production
+  labels:
+    app: patient-records
+    tier: backend
+    criticality: high
+    app.kubernetes.io/name: patient-records
+    app.kubernetes.io/component: microservice
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "5002"
+    description: "Internal ClusterIP service for patient records (PHI — never expose externally)"
+spec:
+  type: ClusterIP
+  selector:
+    app: patient-records
+    tier: backend
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800   # 3 hours — maintains session for active transport cases
+  ports:
+    - name: http
+      port: 5002
+      targetPort: http
+      protocol: TCP

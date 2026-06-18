@@ -1,0 +1,71 @@
+# =============================================================================
+# AeroMed — Application ConfigMap
+# Non-sensitive runtime configuration shared across all 6 microservices.
+# Sensitive values (passwords, keys) live in aeromed-secrets, NOT here.
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aeromed-config
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: aeromed-config
+    app.kubernetes.io/part-of: aeromed-platform
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    description: "Shared runtime configuration for all AeroMed microservices"
+    last-reviewed: "2024-01-15"
+    compliance: "HIPAA-compliant config — no PHI stored in ConfigMaps"
+data:
+  # ---------------------------------------------------------------------------
+  # Runtime environment
+  # ---------------------------------------------------------------------------
+  ENV: "production"
+  LOG_LEVEL: "INFO"
+
+  # ---------------------------------------------------------------------------
+  # Database / connection pool
+  # ---------------------------------------------------------------------------
+  MAX_CONNECTIONS: "200"
+
+  # ---------------------------------------------------------------------------
+  # Health & resilience
+  # ---------------------------------------------------------------------------
+  HEALTH_CHECK_INTERVAL: "30"
+  ALERT_THRESHOLD_RESPONSE_MS: "500"
+  RETRY_ATTEMPTS: "3"
+
+  # Circuit breaker: open after this many consecutive failures
+  # Protects downstream services during cascading failure events
+  CIRCUIT_BREAKER_THRESHOLD: "5"
+
+  # ---------------------------------------------------------------------------
+  # Emergency dispatch tuning
+  # P1 events queue — large enough to absorb mass-casualty burst without dropping
+  # ---------------------------------------------------------------------------
+  EMERGENCY_PRIORITY_QUEUE_SIZE: "100"
+
+  # ---------------------------------------------------------------------------
+  # Medical records compliance
+  # 2555 days = 7 years — HIPAA minimum retention for medical records
+  # ---------------------------------------------------------------------------
+  DATA_RETENTION_DAYS: "2555"
+
+  # ---------------------------------------------------------------------------
+  # Service discovery (Kubernetes DNS FQDNs)
+  # Used by services that need to call siblings directly (not via gateway)
+  # ---------------------------------------------------------------------------
+  FLIGHT_OPS_HOST: "flight-operations.aeromed-production.svc.cluster.local"
+  PATIENT_RECORDS_HOST: "patient-records.aeromed-production.svc.cluster.local"
+  MEDICAL_EQUIPMENT_HOST: "medical-equipment.aeromed-production.svc.cluster.local"
+  EMERGENCY_DISPATCH_HOST: "emergency-dispatch.aeromed-production.svc.cluster.local"
+  AIRCRAFT_COMMS_HOST: "aircraft-comms.aeromed-production.svc.cluster.local"
+
+  # ---------------------------------------------------------------------------
+  # Observability
+  # ---------------------------------------------------------------------------
+  METRICS_ENABLED: "true"
+  METRICS_PATH: "/metrics"
+  TRACING_ENABLED: "true"
+  TRACING_SAMPLE_RATE: "0.1"    # 10% sampling in production — adjust for incidents

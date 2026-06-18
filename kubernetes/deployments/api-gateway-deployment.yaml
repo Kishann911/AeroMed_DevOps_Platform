@@ -1,0 +1,154 @@
+# =============================================================================
+# AeroMed — API Gateway Deployment
+# Public entry point: proxies all 5 backend services, aggregated health,
+# failure simulation endpoint for demos
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: aeromed-production
+  labels:
+    app: api-gateway
+    tier: gateway
+    criticality: high
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    description: "Public-facing API gateway — single entry point for all AeroMed consumers"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+      tier: gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # Zero downtime — this is the single external entry point
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        tier: gateway
+        criticality: high
+        app.kubernetes.io/name: api-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "5000"
+    spec:
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - api-gateway
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: api-gateway
+          image: aeromed/api-gateway:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+          env:
+            - name: SERVICE_NAME
+              value: "api-gateway"
+            - name: PORT
+              value: "5000"
+            - name: ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: FLIGHT_OPS_URL
+              value: "http://flight-operations.aeromed-production.svc.cluster.local:5001"
+            - name: PATIENT_RECORDS_URL
+              value: "http://patient-records.aeromed-production.svc.cluster.local:5002"
+            - name: MEDICAL_EQUIPMENT_URL
+              value: "http://medical-equipment.aeromed-production.svc.cluster.local:5003"
+            - name: EMERGENCY_DISPATCH_URL
+              value: "http://emergency-dispatch.aeromed-production.svc.cluster.local:5004"
+            - name: AIRCRAFT_COMMS_URL
+              value: "http://aircraft-comms.aeromed-production.svc.cluster.local:5005"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          envFrom:
+            - configMapRef:
+                name: aeromed-config
+            - secretRef:
+                name: aeromed-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: api-gateway

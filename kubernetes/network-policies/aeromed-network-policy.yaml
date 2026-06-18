@@ -1,0 +1,296 @@
+# =============================================================================
+# AeroMed — NetworkPolicies
+#
+# Zero-trust network model: deny everything, then open only what is needed.
+# Apply order matters — Kubernetes evaluates all matching policies (union of
+# all allow rules). A packet is allowed if ANY policy permits it.
+#
+# Policy inventory:
+#   1. default-deny-all-ingress        — blocks all incoming traffic by default
+#   2. allow-api-gateway-public        — opens port 5000 on api-gateway to world
+#   3. allow-intra-namespace           — services within aeromed-production talk freely
+#   4. allow-monitoring-scrape         — aeromed-monitoring scrapes /metrics ports
+#   5. allow-all-egress                — pods can initiate outbound connections
+#   6. allow-dns-egress                — DNS resolution on port 53 (UDP+TCP)
+#   7. allow-ingress-controller        — NGINX ingress controller → services
+#   8. allow-health-probes             — kubelet node IPs → /health endpoints
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Default Deny All Ingress
+# Selecting all pods (empty podSelector) with empty ingress rules means:
+# "no ingress traffic is permitted unless another policy explicitly allows it."
+# This is the foundation of the zero-trust model.
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all-ingress
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: default-deny-all-ingress
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Zero-trust baseline — denies ALL ingress until explicitly allowed"
+    security-tier: "critical"
+spec:
+  podSelector: {}      # Selects ALL pods in the namespace
+  policyTypes:
+    - Ingress          # Only restricts ingress; egress handled by policy #5
+
+# ---------------------------------------------------------------------------
+# 2. Allow Public Ingress → API Gateway (port 5000)
+# The ONLY pod reachable from outside the namespace is the api-gateway.
+# All other services are internal-only (protected by policy #1).
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-gateway-public
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: allow-api-gateway-public
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Allows external traffic (from NGINX ingress) to reach api-gateway on port 5000"
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from anywhere — the NGINX ingress controller (which itself lives in
+    # ingress-nginx namespace or kube-system) forwards external traffic here.
+    # The LoadBalancer service and Ingress resource handle the actual external
+    # exposure; this policy permits the forwarded packets to reach the pod.
+    - ports:
+        - protocol: TCP
+          port: 5000
+
+# ---------------------------------------------------------------------------
+# 3. Allow Intra-Namespace Communication
+# Services within aeromed-production must call each other:
+#   api-gateway → all 5 backend services
+#   emergency-dispatch → flight-operations (for aircraft assignment)
+#   aircraft-comms → patient-records (for in-flight patient status)
+# Rather than enumerate every pair, we allow all traffic within the namespace.
+# The services themselves enforce authentication via tokens.
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: allow-intra-namespace
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Allows unrestricted pod-to-pod communication within aeromed-production"
+spec:
+  podSelector: {}      # All pods in the namespace
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}   # Any pod in the same namespace
+      ports:
+        - protocol: TCP
+          port: 5000        # api-gateway
+        - protocol: TCP
+          port: 5001        # flight-operations
+        - protocol: TCP
+          port: 5002        # patient-records
+        - protocol: TCP
+          port: 5003        # medical-equipment
+        - protocol: TCP
+          port: 5004        # emergency-dispatch
+        - protocol: TCP
+          port: 5005        # aircraft-comms
+
+# ---------------------------------------------------------------------------
+# 4. Allow Monitoring Namespace → Metrics Ports
+# Prometheus (in aeromed-monitoring) scrapes /metrics on each service's port.
+# Only namespaceSelector is used — no specific pod required — so any pod
+# deployed to aeromed-monitoring (Prometheus, Grafana agents) can scrape.
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: allow-monitoring-scrape
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Permits Prometheus in aeromed-monitoring to scrape /metrics on all service ports"
+spec:
+  podSelector: {}      # All pods expose /metrics
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: aeromed-monitoring
+      ports:
+        - protocol: TCP
+          port: 5000        # api-gateway /metrics
+        - protocol: TCP
+          port: 5001        # flight-operations /metrics
+        - protocol: TCP
+          port: 5002        # patient-records /metrics
+        - protocol: TCP
+          port: 5003        # medical-equipment /metrics
+        - protocol: TCP
+          port: 5004        # emergency-dispatch /metrics
+        - protocol: TCP
+          port: 5005        # aircraft-comms /metrics
+
+# ---------------------------------------------------------------------------
+# 5. Allow All Egress from aeromed-production
+# Services need outbound access for:
+#   - Calling sibling services (covered by policy #3 on the receive side)
+#   - RDS PostgreSQL connections (port 5432 in the VPC)
+#   - External APIs (aircraft ground-to-air comms, hospital systems)
+#   - AWS SDK calls (S3, Secrets Manager, CloudWatch)
+#   - Pulling container images (ECR)
+# We allow all egress and rely on AWS Security Groups + VPC ACLs to
+# enforce network-level egress restrictions at the infrastructure layer.
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-all-egress
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: allow-all-egress
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Permits all outbound traffic — egress restrictions enforced at VPC/SG layer"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - {}    # Allows all destinations and ports
+
+# ---------------------------------------------------------------------------
+# 6. Allow DNS Egress (explicit — required when egress is restricted)
+# Even with policy #5 above, this is included for environments where a
+# stricter default-deny-egress policy is applied at a higher level.
+# CoreDNS lives in kube-system and serves port 53 UDP+TCP.
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: allow-dns-egress
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Explicitly permits DNS resolution — required for service discovery"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+# ---------------------------------------------------------------------------
+# 7. Allow NGINX Ingress Controller → All Services
+# The ingress controller lives in its own namespace (typically ingress-nginx).
+# Without this policy it would be blocked by the default-deny rule from
+# forwarding traffic to specific service backends.
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: allow-ingress-controller
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Permits NGINX ingress pods to forward traffic to AeroMed backends"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 5000
+        - protocol: TCP
+          port: 5001
+        - protocol: TCP
+          port: 5002
+        - protocol: TCP
+          port: 5003
+        - protocol: TCP
+          port: 5004
+        - protocol: TCP
+          port: 5005
+
+# ---------------------------------------------------------------------------
+# 8. Allow Kubelet Health Probes
+# Liveness and readiness probes originate from the node's kubelet process,
+# not from within the cluster network. The source is the node's host IP
+# (ipBlock). Without this, probes fail and pods get restarted incorrectly.
+# The /16 covers all node IPs in our VPC (10.0.0.0/16 from Terraform).
+# ---------------------------------------------------------------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kubelet-health-probes
+  namespace: aeromed-production
+  labels:
+    app.kubernetes.io/name: allow-kubelet-health-probes
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    description: "Permits kubelet liveness/readiness probes from node IPs (VPC CIDR)"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/16    # VPC CIDR — all node IPs in the AeroMed VPC
+      ports:
+        - protocol: TCP
+          port: 5000
+        - protocol: TCP
+          port: 5001
+        - protocol: TCP
+          port: 5002
+        - protocol: TCP
+          port: 5003
+        - protocol: TCP
+          port: 5004
+        - protocol: TCP
+          port: 5005

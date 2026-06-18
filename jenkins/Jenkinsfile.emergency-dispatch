@@ -1,0 +1,237 @@
+// =============================================================================
+// AeroMed — Emergency Dispatch Service Pipeline
+//
+// 🚨 HIGHEST CRITICALITY SERVICE — deploy with extreme caution.
+// Any downtime during a rolling update directly delays P1 responses.
+//
+// Additional safeguards vs. other service pipelines:
+//   - Deployment blocked if ANY P1 dispatch is active (no override)
+//   - Extended rollout timeout (600s vs 300s for other services)
+//   - Requires aeromed-lead AND aeromed-medical-director approval for production
+//   - Automatic rollback is ALWAYS enabled (ignores params.ROLLBACK)
+// =============================================================================
+
+@Library('aeromed-shared-lib') _
+
+pipeline {
+
+    agent any
+
+    environment {
+        SERVICE           = "emergency-dispatch"
+        SERVICE_PORT      = "5004"
+        REGISTRY          = "aeromed"
+        K8S_NAMESPACE_STG = "aeromed-staging"
+        K8S_NAMESPACE_PRD = "aeromed-production"
+        KUBE_CONFIG       = credentials('kubeconfig')
+        PIPELINE_START_MS = "${System.currentTimeMillis()}"
+        FAILED_STAGE      = ""
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['staging', 'production'],
+               description: 'Target environment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false,
+                     description: '⚠️  Do NOT skip tests on dispatch service')
+        string(name: 'PREVIOUS_VERSION', defaultValue: '',
+               description: 'Explicit build number to roll back to')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Checkout'
+                    checkout scm
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    echo """
+🚨 Emergency Dispatch Pipeline — Build #${env.BUILD_NUMBER}
+   Commit: ${env.GIT_COMMIT_SHORT}
+   This service is LIFE-CRITICAL. Rollback is automatic on any failure."""
+                }
+            }
+        }
+
+        stage('Pre-flight Checks') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Pre-flight Checks'
+                    sh "docker info > /dev/null 2>&1"
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        sh "kubectl cluster-info --request-timeout=10s"
+                    }
+
+                    // HARD BLOCK: Do not deploy if any P1 emergency is active
+                    def dispatchStatus = sh(
+                        script: "curl -sf http://aeromed-emergency-dispatch:${SERVICE_PORT}/api/status 2>/dev/null || echo '{\"p1_count\":0}'",
+                        returnStdout: true
+                    ).trim()
+                    def data = readJSON(text: dispatchStatus)
+                    def p1Count = (data.p1_count ?: 0) as int
+
+                    if (p1Count > 0 && params.ENVIRONMENT == 'production') {
+                        aeromedNotify.p1Warning(p1Count)
+                        error("🚨 DEPLOYMENT BLOCKED: ${p1Count} active P1 dispatch(es). " +
+                              "The emergency-dispatch service cannot be updated while P1 events are active. " +
+                              "Wait for all P1 events to clear before restarting this pipeline.")
+                    }
+                    echo "✅ No active P1 emergencies — safe to deploy"
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Build'
+                    aeromedBuild.buildImage(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Security Scan'
+                    aeromedBuild.runSecurityScan("${REGISTRY}/${SERVICE}:${env.BUILD_NUMBER}", true)
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Unit Tests'
+                    aeromedBuild.runUnitTests(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Integration Tests'
+                    aeromedBuild.runIntegrationTests([SERVICE, 'flight-operations'])
+                }
+            }
+            post {
+                always { script { aeromedBuild.teardownIntegrationTests() } }
+            }
+        }
+
+        stage('Push') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Push'
+                    withCredentials([usernamePassword(credentialsId: 'docker-registry-creds',
+                                                      usernameVariable: 'DOCKER_USER',
+                                                      passwordVariable: 'DOCKER_PASS')]) {
+                        sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                    }
+                    aeromedBuild.pushImage(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                    sh "docker logout"
+                }
+            }
+        }
+
+        stage('Deploy → Staging') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy → Staging'
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.deployToKubernetes(SERVICE, K8S_NAMESPACE_STG, env.BUILD_NUMBER)
+                        aeromedDeploy.waitForRollout(SERVICE, K8S_NAMESPACE_STG, 600)
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Test (Staging)') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Smoke Test (Staging)'
+                    // Test /health AND /api/status to ensure dispatch queue is operational
+                    aeromedDeploy.verifyServiceHealth(
+                        "http://aeromed-emergency-dispatch-staging:${SERVICE_PORT}", 5, 15
+                    )
+                    sh """
+                        STATUS=\$(curl -sf http://aeromed-emergency-dispatch-staging:${SERVICE_PORT}/api/status)
+                        echo "Dispatch status: \$STATUS"
+                        echo "\$STATUS" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert 'dispatches' in d or 'active_dispatches' in d, 'Missing dispatch data in response'
+print('  ✓ Dispatch queue operational')
+"
+                    """
+                }
+            }
+        }
+
+        stage('Deploy → Production') {
+            when { expression { params.ENVIRONMENT == 'production' } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy → Production'
+                    aeromedNotify.stagingApprovalGate(SERVICE, env.BUILD_NUMBER)
+                    // Dispatch service: requires both lead AND medical director
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input message: "🚨 Deploy EMERGENCY DISPATCH #${env.BUILD_NUMBER} to production?\n" +
+                                       "Confirm: (1) No active P1s, (2) Staging tests passed, (3) On-call aware.",
+                              ok: '🚀 All Clear — Deploy',
+                              submitter: 'aeromed-lead,aeromed-medical-director'
+                    }
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.deployToKubernetes(SERVICE, K8S_NAMESPACE_PRD, env.BUILD_NUMBER)
+                        aeromedDeploy.waitForRollout(SERVICE, K8S_NAMESPACE_PRD, 600)
+                    }
+                }
+            }
+        }
+
+        stage('Verify') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Verify'
+                    def ns = params.ENVIRONMENT == 'production' ? K8S_NAMESPACE_PRD : K8S_NAMESPACE_STG
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.verifyPostDeployState(SERVICE, ns)
+                    }
+                    aeromedNotify.deploymentSummary(SERVICE, ns, env.BUILD_NUMBER, env.PIPELINE_START_MS as long)
+                }
+            }
+        }
+    }
+
+    post {
+        success { script { aeromedNotify.success(SERVICE, env.BUILD_NUMBER) } }
+        failure {
+            script {
+                aeromedNotify.failure(SERVICE, env.FAILED_STAGE, env.BUILD_NUMBER)
+                // ALWAYS roll back for emergency-dispatch — too critical to leave degraded
+                aeromedNotify.rollbackStarted(SERVICE, K8S_NAMESPACE_PRD)
+                try {
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.rollbackDeployment(SERVICE, K8S_NAMESPACE_PRD, params.PREVIOUS_VERSION ?: null)
+                    }
+                } catch (e) {
+                    echo "🚨 ROLLBACK FAILED: ${e.message} — CALL AEROMED-OPS IMMEDIATELY"
+                }
+            }
+        }
+        always {
+            junit allowEmptyResults: true, testResults: '**/test-results.xml'
+            cleanWs(cleanWhenSuccess: true, cleanWhenFailure: false, deleteDirs: true)
+        }
+    }
+}

@@ -1,0 +1,36 @@
+# =============================================================================
+# AeroMed — Aircraft Communications Service (ClusterIP)
+# Internal-only — telemetry stream, session affinity critical for active links
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: aircraft-comms
+  namespace: aeromed-production
+  labels:
+    app: aircraft-comms
+    tier: backend
+    criticality: high
+    app.kubernetes.io/name: aircraft-comms
+    app.kubernetes.io/component: microservice
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "5005"
+    description: "Internal ClusterIP service for aircraft telemetry and communications"
+spec:
+  type: ClusterIP
+  selector:
+    app: aircraft-comms
+    tier: backend
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800   # 3 hours — prevents mid-flight session interruption
+  ports:
+    - name: http
+      port: 5005
+      targetPort: http
+      protocol: TCP

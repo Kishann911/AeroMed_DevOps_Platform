@@ -1,0 +1,36 @@
+# =============================================================================
+# AeroMed — Flight Operations Service (ClusterIP)
+# Internal-only — consumed by api-gateway and monitoring
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: flight-operations
+  namespace: aeromed-production
+  labels:
+    app: flight-operations
+    tier: backend
+    criticality: high
+    app.kubernetes.io/name: flight-operations
+    app.kubernetes.io/component: microservice
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "5001"
+    description: "Internal ClusterIP service for flight tracking"
+spec:
+  type: ClusterIP
+  selector:
+    app: flight-operations
+    tier: backend
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800   # 3 hours — covers a full flight duration
+  ports:
+    - name: http
+      port: 5001
+      targetPort: http
+      protocol: TCP

@@ -1,0 +1,5 @@
+flask
+gunicorn
+prometheus-client
+requests
+python-dotenv

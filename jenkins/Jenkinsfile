@@ -1,0 +1,540 @@
+// =============================================================================
+// AeroMed DevOps Platform — Master CI/CD Pipeline
+//
+// Manages build, test, security scan, and deployment for all 6 microservices.
+// Designed for zero-downtime deployment to a critical healthcare platform.
+//
+// Shared library must be configured in Jenkins:
+//   Manage Jenkins → Configure System → Global Pipeline Libraries
+//   Name: aeromed-shared-lib | SCM: this repo | Default Version: main
+// =============================================================================
+
+@Library('aeromed-shared-lib') _
+
+pipeline {
+
+    agent any
+
+    // -------------------------------------------------------------------------
+    // Credentials and environment
+    // -------------------------------------------------------------------------
+    environment {
+        REGISTRY          = "aeromed"
+        K8S_NAMESPACE_STG = "aeromed-staging"
+        K8S_NAMESPACE_PRD = "aeromed-production"
+        KUBE_CONFIG       = credentials('kubeconfig')
+        DOCKER_REGISTRY   = credentials('docker-registry-creds')
+        EMERGENCY_DISPATCH_URL = "http://aeromed-emergency-dispatch:5004"
+        PIPELINE_START_MS = "${System.currentTimeMillis()}"
+        FAILED_STAGE      = ""
+    }
+
+    // -------------------------------------------------------------------------
+    // Build parameters
+    // -------------------------------------------------------------------------
+    parameters {
+        choice(
+            name: 'SERVICE',
+            choices: ['all', 'flight-operations', 'patient-records',
+                      'medical-equipment', 'emergency-dispatch',
+                      'aircraft-comms', 'api-gateway'],
+            description: 'Service to build and deploy. "all" runs the full platform pipeline.'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['staging', 'production'],
+            description: 'Target deployment environment. Production requires manual approval.'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: '⚠️  Skip unit/integration tests (emergency hotfix only — requires justification comment)'
+        )
+        booleanParam(
+            name: 'ROLLBACK',
+            defaultValue: false,
+            description: 'Trigger automatic rollback on pipeline failure'
+        )
+        string(
+            name: 'PREVIOUS_VERSION',
+            defaultValue: '',
+            description: 'Explicit build number to roll back to (leave empty for previous K8s revision)'
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // Global pipeline options
+    // -------------------------------------------------------------------------
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        timeout(time: 90, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds(abortPrevious: false)   // allow parallel staging builds
+    }
+
+    // =========================================================================
+    // STAGES
+    // =========================================================================
+    stages {
+
+        // ── Stage 1: Checkout ────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Checkout'
+                    checkout scm
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD", returnStdout: true
+                    ).trim()
+                    env.GIT_COMMIT_MSG = sh(
+                        script: "git log -1 --pretty=%B", returnStdout: true
+                    ).trim()
+                    env.GIT_AUTHOR = sh(
+                        script: "git log -1 --pretty=%an", returnStdout: true
+                    ).trim()
+
+                    echo """
+╔══════════════════════════════════════════════════════════╗
+║  AeroMed Platform — Build #${env.BUILD_NUMBER.padRight(30)}║
+╠══════════════════════════════════════════════════════════╣
+║  Service  : ${params.SERVICE.padRight(44)}║
+║  Target   : ${params.ENVIRONMENT.padRight(44)}║
+║  Commit   : ${env.GIT_COMMIT_SHORT.padRight(44)}║
+║  Author   : ${env.GIT_AUTHOR.padRight(44)}║
+║  Branch   : ${(env.GIT_BRANCH ?: 'unknown').padRight(44)}║
+║  Message  : ${env.GIT_COMMIT_MSG.take(44).padRight(44)}║
+╚══════════════════════════════════════════════════════════╝"""
+                }
+            }
+        }
+
+        // ── Stage 2: Pre-flight Checks ───────────────────────────────────────
+        stage('Pre-flight Checks') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Pre-flight Checks'
+
+                    // 1. Docker daemon must be reachable
+                    sh "docker info > /dev/null 2>&1 || (echo 'ERROR: Docker not running' && exit 1)"
+                    echo "✅ Docker is running"
+
+                    // 2. kubectl must be accessible
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        sh "kubectl cluster-info --request-timeout=10s || (echo 'ERROR: kubectl cannot reach cluster' && exit 1)"
+                    }
+                    echo "✅ kubectl cluster accessible"
+
+                    // 3. Check for active P1/P2 emergencies before deploying
+                    //    A rolling update during an active P1 could briefly reduce
+                    //    dispatch capacity — operators must acknowledge the risk.
+                    def dispatchStatus = sh(
+                        script: """
+                            curl -sf --max-time 8 ${EMERGENCY_DISPATCH_URL}/api/status 2>/dev/null || \
+                            echo '{"p1_count":0,"active_dispatches":0}'
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    def dispatch = readJSON(text: dispatchStatus)
+                    def p1Count  = dispatch.p1_count   ?: 0
+                    def p2Count  = 0
+                    def total    = dispatch.active_dispatches ?: 0
+
+                    echo "Emergency dispatch status: P1=${p1Count}, Active=${total}"
+
+                    if (p1Count > 0 && params.ENVIRONMENT == 'production') {
+                        aeromedNotify.p1Warning(p1Count as int)
+                        timeout(time: 30, unit: 'MINUTES') {
+                            input(
+                                message: "⚠️  ${p1Count} active P1 emergency dispatch(es) detected. " +
+                                         "Deploying to production will trigger a rolling restart. " +
+                                         "Approve only if you have confirmed with the dispatch team.",
+                                ok: 'Deploy Anyway — I have confirmed with dispatch',
+                                submitter: 'aeromed-lead,aeromed-ops'
+                            )
+                        }
+                    }
+
+                    echo "✅ Pre-flight checks passed"
+                }
+            }
+        }
+
+        // ── Stage 3: Build Images ─────────────────────────────────────────────
+        stage('Build Images') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Build Images'
+                    env.IMAGE_TAGS   = [:]
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    echo "Building ${services.size()} image(s): ${services.join(', ')}"
+
+                    for (svc in services) {
+                        def tag = aeromedBuild.buildImage(svc, env.BUILD_NUMBER, REGISTRY)
+                        env["IMAGE_TAG_${svc.replace('-', '_').toUpperCase()}"] = tag
+                    }
+
+                    // Print image size summary
+                    sh "docker images --filter=reference='${REGISTRY}/*:${env.BUILD_NUMBER}' --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}'"
+                }
+            }
+        }
+
+        // ── Stage 4: Security Scan (Trivy) ───────────────────────────────────
+        stage('Security Scan') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Security Scan'
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    // Pull Trivy DB once, reuse across all scans
+                    sh """
+                        docker run --rm \
+                            -v trivy-cache:/root/.cache/ \
+                            aquasec/trivy:latest image --download-db-only --quiet
+                    """
+
+                    for (svc in services) {
+                        echo "Scanning: ${REGISTRY}/${svc}:${env.BUILD_NUMBER}"
+                        aeromedBuild.runSecurityScan(
+                            "${REGISTRY}/${svc}:${env.BUILD_NUMBER}",
+                            true    // failOnCritical
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── Stage 5: Unit Tests ───────────────────────────────────────────────
+        stage('Unit Tests') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Unit Tests'
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    for (svc in services) {
+                        aeromedBuild.runUnitTests(svc, env.BUILD_NUMBER, REGISTRY)
+                    }
+                }
+            }
+        }
+
+        // ── Stage 6: Integration Tests ────────────────────────────────────────
+        stage('Integration Tests') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Integration Tests'
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    aeromedBuild.runIntegrationTests(services)
+                }
+            }
+            post {
+                always {
+                    // Always tear down the compose stack, even if tests fail
+                    script { aeromedBuild.teardownIntegrationTests() }
+                }
+            }
+        }
+
+        // ── Stage 7: Push to Registry ─────────────────────────────────────────
+        stage('Push to Registry') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Push to Registry'
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-registry-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                    }
+
+                    for (svc in services) {
+                        aeromedBuild.pushImage(svc, env.BUILD_NUMBER, REGISTRY)
+                    }
+
+                    sh "docker logout"
+                    echo "✅ All images pushed to registry"
+                }
+            }
+        }
+
+        // ── Stage 8: Deploy to Staging ────────────────────────────────────────
+        stage('Deploy to Staging') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy to Staging'
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        for (svc in services) {
+                            aeromedDeploy.deployToKubernetes(
+                                svc, K8S_NAMESPACE_STG, env.BUILD_NUMBER, REGISTRY
+                            )
+                        }
+                        for (svc in services) {
+                            aeromedDeploy.waitForRollout(svc, K8S_NAMESPACE_STG, 240)
+                        }
+                    }
+
+                    echo "✅ Staging deployment complete"
+                }
+            }
+        }
+
+        // ── Stage 9: Smoke Tests on Staging ──────────────────────────────────
+        stage('Smoke Tests (Staging)') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Smoke Tests (Staging)'
+
+                    def SERVICE_STAGING_URLS = [
+                        'api-gateway'       : 'http://aeromed-api-gateway-staging:5000',
+                        'flight-operations' : 'http://aeromed-flight-operations-staging:5001',
+                        'patient-records'   : 'http://aeromed-patient-records-staging:5002',
+                        'medical-equipment' : 'http://aeromed-medical-equipment-staging:5003',
+                        'emergency-dispatch': 'http://aeromed-emergency-dispatch-staging:5004',
+                        'aircraft-comms'    : 'http://aeromed-aircraft-comms-staging:5005',
+                    ]
+
+                    def services = params.SERVICE == 'all'
+                        ? SERVICE_STAGING_URLS.keySet().toList()
+                        : [params.SERVICE]
+
+                    def results = [:]
+                    for (svc in services) {
+                        def url = SERVICE_STAGING_URLS[svc]
+                        try {
+                            aeromedDeploy.verifyServiceHealth(url, 5, 10)
+                            results[svc] = true
+                        } catch (e) {
+                            results[svc] = false
+                            echo "❌ ${svc} smoke test failed: ${e.message}"
+                        }
+                    }
+
+                    aeromedNotify.smokeTestReport(results)
+                }
+            }
+        }
+
+        // ── Stage 10: Deploy to Production ───────────────────────────────────
+        stage('Deploy to Production') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy to Production'
+
+                    // Manual approval gate — only aeromed-lead or aeromed-ops can approve
+                    aeromedNotify.stagingApprovalGate(params.SERVICE, env.BUILD_NUMBER)
+                    timeout(time: 60, unit: 'MINUTES') {
+                        input(
+                            message: "Deploy ${params.SERVICE} build #${env.BUILD_NUMBER} to PRODUCTION?",
+                            ok: '🚀 Deploy to Production',
+                            submitter: 'aeromed-lead,aeromed-ops',
+                            parameters: [
+                                booleanParam(
+                                    name: 'CONFIRM_PROD',
+                                    defaultValue: false,
+                                    description: 'I confirm this deployment has been reviewed and staging tests passed'
+                                )
+                            ]
+                        )
+                    }
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        // Deploy with zero-downtime verification between each service
+                        for (svc in services) {
+                            echo "━━━ Deploying ${svc} to production ━━━"
+
+                            aeromedDeploy.deployToKubernetes(
+                                svc, K8S_NAMESPACE_PRD, env.BUILD_NUMBER, REGISTRY
+                            )
+                            aeromedDeploy.waitForRollout(svc, K8S_NAMESPACE_PRD, 300)
+
+                            // Verify health before proceeding to next service
+                            // A bad deploy is caught after each service, not at the end
+                            sh """
+                                HEALTHY_PODS=\$(kubectl get pods \
+                                    --namespace=${K8S_NAMESPACE_PRD} \
+                                    -l app=${svc} \
+                                    --field-selector=status.phase=Running \
+                                    -o name | wc -l)
+                                echo "${svc}: \${HEALTHY_PODS} pods running"
+                                [ "\${HEALTHY_PODS}" -ge "2" ] || \
+                                    { echo "FAIL: fewer than 2 pods running for ${svc}"; exit 1; }
+                            """
+                        }
+                    }
+
+                    echo "✅ Production deployment complete"
+                }
+            }
+        }
+
+        // ── Stage 11: Post-Deploy Verification ───────────────────────────────
+        stage('Post-Deploy Verification') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Post-Deploy Verification'
+
+                    def namespace = params.ENVIRONMENT == 'production'
+                        ? K8S_NAMESPACE_PRD : K8S_NAMESPACE_STG
+
+                    def services = params.SERVICE == 'all'
+                        ? ['flight-operations', 'patient-records', 'medical-equipment',
+                           'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                        : [params.SERVICE]
+
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        for (svc in services) {
+                            aeromedDeploy.verifyPostDeployState(svc, namespace)
+                        }
+
+                        // Check Prometheus targets (requires Prometheus accessible from agent)
+                        echo "\n=== Checking Prometheus targets ==="
+                        sh """
+                            curl -sf http://aeromed-prometheus:9090/api/v1/targets \
+                                | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+active = data.get('data', {}).get('activeTargets', [])
+aeromed_targets = [t for t in active if 'aeromed' in t.get('labels', {}).get('job', '')]
+healthy = [t for t in aeromed_targets if t.get('health') == 'up']
+print(f'  Prometheus targets: {len(healthy)}/{len(aeromed_targets)} aeromed targets UP')
+" 2>/dev/null || echo "  Prometheus not reachable from build agent — check via Grafana"
+                        """
+
+                        // Print HPA status for all services
+                        echo "\n=== HPA Status ==="
+                        sh """
+                            kubectl get hpa --namespace=${namespace} \
+                                -o custom-columns='NAME:.metadata.name,MIN:.spec.minReplicas,MAX:.spec.maxReplicas,REPLICAS:.status.currentReplicas,CPU%:.status.currentMetrics[0].resource.current.averageUtilization' \
+                                2>/dev/null || echo "HPAs not yet configured — run: kubectl apply -f kubernetes/hpa/"
+                        """
+                    }
+
+                    echo "✅ Post-deploy verification complete"
+                }
+            }
+        }
+
+        // ── Stage 12: Notify ──────────────────────────────────────────────────
+        stage('Notify') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Notify'
+                    def namespace = params.ENVIRONMENT == 'production'
+                        ? K8S_NAMESPACE_PRD : K8S_NAMESPACE_STG
+
+                    aeromedNotify.deploymentSummary(
+                        params.SERVICE,
+                        namespace,
+                        env.BUILD_NUMBER,
+                        env.PIPELINE_START_MS as long
+                    )
+                }
+            }
+        }
+
+    } // end stages
+
+    // =========================================================================
+    // POST
+    // =========================================================================
+    post {
+        success {
+            script {
+                aeromedNotify.success(params.SERVICE, env.BUILD_NUMBER)
+            }
+        }
+
+        failure {
+            script {
+                aeromedNotify.failure(params.SERVICE, env.FAILED_STAGE, env.BUILD_NUMBER)
+
+                if (params.ROLLBACK && params.ENVIRONMENT == 'production') {
+                    aeromedNotify.rollbackStarted(params.SERVICE, K8S_NAMESPACE_PRD)
+                    try {
+                        def services = params.SERVICE == 'all'
+                            ? ['flight-operations', 'patient-records', 'medical-equipment',
+                               'emergency-dispatch', 'aircraft-comms', 'api-gateway']
+                            : [params.SERVICE]
+
+                        withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                            for (svc in services) {
+                                aeromedDeploy.rollbackDeployment(
+                                    svc,
+                                    K8S_NAMESPACE_PRD,
+                                    params.PREVIOUS_VERSION ?: null
+                                )
+                            }
+                        }
+                        echo "✅ Rollback completed successfully"
+                    } catch (rollbackEx) {
+                        echo "🚨 ROLLBACK ALSO FAILED: ${rollbackEx.message}"
+                        echo "Manual intervention required — contact aeromed-ops immediately"
+                    }
+                }
+            }
+        }
+
+        always {
+            script {
+                // Archive test results if they exist
+                sh "find . -name 'test-results.xml' -exec ls -la {} \\; 2>/dev/null || true"
+            }
+            junit allowEmptyResults: true, testResults: '**/test-results.xml'
+            cleanWs(
+                cleanWhenAborted: true,
+                cleanWhenFailure: false,   // keep workspace on failure for debugging
+                cleanWhenSuccess: true,
+                cleanWhenUnstable: false,
+                deleteDirs: true
+            )
+        }
+    }
+
+} // end pipeline

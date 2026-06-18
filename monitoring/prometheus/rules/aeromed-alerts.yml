@@ -1,0 +1,406 @@
+# =============================================================================
+# AeroMed — Application Alert Rules
+# Critical Care Air Ambulance Operations
+#
+# Severity levels:
+#   critical — immediate human action required; patient safety may be at risk
+#   warning  — degraded state; investigate within the hour
+#   info     — informational; no immediate action needed
+#
+# All critical alerts route to aeromed-critical SNS topic (PagerDuty / on-call).
+# Warning alerts route to aeromed-ops-team SNS topic (email + Slack).
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  # Group 1 — Aircraft Safety
+  # Flight operations and communications — direct patient safety impact
+  # ===========================================================================
+  - name: aeromed.aircraft.safety
+    interval: 15s    # Evaluate more frequently than global (15s) for safety alerts
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 1. AircraftCommunicationLost
+      # Triggers if signal_strength metric is absent OR equals 0 (lost).
+      # "absent()" fires if the metric stops being reported entirely —
+      # which itself indicates a comms failure.
+      # -----------------------------------------------------------------------
+      - alert: AircraftCommunicationLost
+        expr: |
+          aeromed_aircraft_signal_strength == 0
+          OR
+          absent(aeromed_aircraft_signal_strength{job="aeromed-aircraft-comms"})
+        for: 1m
+        labels:
+          severity: critical
+          team:     aeromed-flight-ops
+          runbook:  "https://wiki.aeromed.internal/runbooks/aircraft-comms-lost"
+        annotations:
+          summary: "Aircraft communication link lost"
+          description: >-
+            Aircraft communication lost on {{ $labels.aircraft_id | default "unknown" }}.
+            Patient transport may be affected. Signal strength: {{ $value }}.
+            Last known position may be stale. Activate backup HF radio protocol immediately.
+          dashboard: "http://grafana:3000/d/aircraft-comms/aircraft-communications"
+
+      # -----------------------------------------------------------------------
+      # AircraftSignalWeak — precursor alert before full loss
+      # -----------------------------------------------------------------------
+      - alert: AircraftSignalWeak
+        expr: aeromed_aircraft_signal_strength == 1    # 1 = weak, 0 = lost, 2 = strong
+        for: 3m
+        labels:
+          severity: warning
+          team:     aeromed-flight-ops
+        annotations:
+          summary: "Aircraft signal degraded to WEAK"
+          description: >-
+            Aircraft {{ $labels.aircraft_id | default "unknown" }} has weak signal for 3m.
+            Monitor closely — may escalate to AircraftCommunicationLost.
+
+  # ===========================================================================
+  # Group 2 — Service Availability
+  # Any AeroMed service going down is an emergency during active operations
+  # ===========================================================================
+  - name: aeromed.service.availability
+    interval: 15s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 2. ServiceDown
+      # up == 0 means Prometheus cannot scrape the target — service is unreachable.
+      # 30s for: accounts for one missed scrape (15s interval) before alerting.
+      # -----------------------------------------------------------------------
+      - alert: ServiceDown
+        expr: up{job=~"aeromed-.*"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          team:     aeromed-ops
+          runbook:  "https://wiki.aeromed.internal/runbooks/service-down"
+        annotations:
+          summary: "AeroMed service {{ $labels.job }} is DOWN"
+          description: >-
+            Service {{ $labels.job }} at {{ $labels.instance }} has been unreachable
+            for 30 seconds. Prometheus cannot scrape its /metrics endpoint.
+            Immediate action required — this service is part of the critical care platform.
+          dashboard: "http://grafana:3000/d/aeromed-overview/platform-overview"
+
+      # -----------------------------------------------------------------------
+      # 8. MedicalRecordsServiceUnavailable — escalated version of ServiceDown
+      # Shorter for: 10s because PHI access loss during active transport is
+      # immediately dangerous (paramedics cannot access patient medication history).
+      # -----------------------------------------------------------------------
+      - alert: MedicalRecordsServiceUnavailable
+        expr: up{job="aeromed-patient-records"} == 0
+        for: 10s
+        labels:
+          severity: critical
+          team:     aeromed-ops
+          phi:      "true"
+          runbook:  "https://wiki.aeromed.internal/runbooks/patient-records-down"
+        annotations:
+          summary: "CRITICAL: Patient records service unavailable"
+          description: >-
+            The patient-records service has been unreachable for 10 seconds.
+            Active transport operations are at risk — paramedics cannot access
+            patient medication history, allergies, or pre-existing conditions.
+            Failover to offline patient record protocol immediately.
+            Escalate to medical director if not resolved within 2 minutes.
+
+      # -----------------------------------------------------------------------
+      # EmergencyDispatchServiceDown — escalated version of ServiceDown
+      # -----------------------------------------------------------------------
+      - alert: EmergencyDispatchServiceDown
+        expr: up{job="aeromed-emergency-dispatch"} == 0
+        for: 15s
+        labels:
+          severity: critical
+          team:     aeromed-ops
+          runbook:  "https://wiki.aeromed.internal/runbooks/dispatch-down"
+        annotations:
+          summary: "CRITICAL: Emergency dispatch service DOWN"
+          description: >-
+            The emergency-dispatch service is unreachable.
+            New P1/P2 emergencies cannot be queued or assigned to aircraft.
+            Activate manual dispatch protocol immediately.
+            Contact aeromed-medical-director and aeromed-lead on-call.
+
+      # -----------------------------------------------------------------------
+      # ServiceFlapping — service is intermittently up/down
+      # -----------------------------------------------------------------------
+      - alert: ServiceFlapping
+        expr: |
+          changes(up{job=~"aeromed-.*"}[10m]) > 4
+        for: 0m    # Fire immediately — flapping itself is the issue
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Service {{ $labels.job }} is flapping"
+          description: >-
+            {{ $labels.job }} has changed state (up/down) {{ $value }} times
+            in the last 10 minutes. Indicates crash-loop or network instability.
+
+  # ===========================================================================
+  # Group 3 — Performance Degradation
+  # Response time and throughput — degrades dispatch and comms quality
+  # ===========================================================================
+  - name: aeromed.performance
+    interval: 30s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 3. HighResponseTime
+      # response_time_seconds > 2s for 2 minutes consistently.
+      # Medical operations (dispatch lookups, patient data) must be sub-second.
+      # -----------------------------------------------------------------------
+      - alert: HighResponseTime
+        expr: |
+          histogram_quantile(0.95,
+            rate(response_time_seconds_bucket{job=~"aeromed-.*"}[5m])
+          ) > 2
+        for: 2m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "High response time on {{ $labels.job }}"
+          description: >-
+            The 95th percentile response time for {{ $labels.job }}
+            (endpoint: {{ $labels.endpoint | default "unknown" }}) has exceeded
+            2 seconds for 2 minutes. Current p95: {{ $value | humanizeDuration }}.
+            Medical staff waiting on data lookups — investigate immediately.
+
+      # -----------------------------------------------------------------------
+      # CriticalEndpointSlowResponse — tighter threshold for dispatch
+      # -----------------------------------------------------------------------
+      - alert: CriticalEndpointSlowResponse
+        expr: |
+          histogram_quantile(0.99,
+            rate(response_time_seconds_bucket{
+              job="aeromed-emergency-dispatch"
+            }[5m])
+          ) > 0.5
+        for: 1m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Emergency dispatch p99 latency > 500ms"
+          description: >-
+            P99 response time on emergency-dispatch: {{ $value | humanizeDuration }}.
+            Dispatch decisions require sub-500ms responses.
+
+      # -----------------------------------------------------------------------
+      # HighErrorRate
+      # -----------------------------------------------------------------------
+      - alert: HighErrorRate
+        expr: |
+          (
+            rate(requests_total{job=~"aeromed-.*", status=~"5.."}[5m])
+            /
+            rate(requests_total{job=~"aeromed-.*"}[5m])
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "High error rate on {{ $labels.job }}"
+          description: >-
+            {{ $labels.job }} is returning {{ $value | humanizePercentage }} errors
+            (HTTP 5xx) over the last 5 minutes.
+
+  # ===========================================================================
+  # Group 4 — Emergency Dispatch Operations
+  # Queue backlog = dispatch cannot keep up with incoming emergencies
+  # ===========================================================================
+  - name: aeromed.dispatch
+    interval: 15s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 4. EmergencyQueueBacklog
+      # Queue depth > 10 means the system cannot process emergencies fast enough.
+      # During a mass-casualty event this could spike; the 1m for: avoids false
+      # positives on brief bursts.
+      # -----------------------------------------------------------------------
+      - alert: EmergencyQueueBacklog
+        expr: aeromed_emergency_queue_size > 10
+        for: 1m
+        labels:
+          severity: critical
+          team:     aeromed-dispatch
+          runbook:  "https://wiki.aeromed.internal/runbooks/queue-backlog"
+        annotations:
+          summary: "Emergency dispatch queue overloaded"
+          description: >-
+            The emergency dispatch queue has {{ $value }} pending requests
+            (threshold: 10). The system may be unable to process new P1 emergencies
+            in time. Scale emergency-dispatch pods immediately:
+            kubectl scale deployment/emergency-dispatch --replicas=+2 -n aeromed-production
+          impact: "Delayed emergency response — lives may be at risk"
+
+      # -----------------------------------------------------------------------
+      # P1EmergencyResponseTimeExceeded
+      # -----------------------------------------------------------------------
+      - alert: P1EmergencyResponseTimeExceeded
+        expr: aeromed_dispatch_response_time_minutes{priority="P1"} > 8
+        for: 0m
+        labels:
+          severity: critical
+          team:     aeromed-dispatch
+        annotations:
+          summary: "P1 response time exceeding 8 minutes"
+          description: >-
+            A P1 (cardiac/trauma) dispatch has response time {{ $value }} minutes.
+            Target SLA is 8 minutes. Immediate escalation to medical director required.
+
+  # ===========================================================================
+  # Group 5 — Resource Pressure
+  # Pod CPU, memory — precursors to OOMKill or throttling
+  # ===========================================================================
+  - name: aeromed.resources
+    interval: 30s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 6. HighCPUUsage
+      # container_cpu_usage_seconds_total > 0.8 of the CPU limit for 5 minutes.
+      # Indicates the container is being throttled — add resources or scale out.
+      # -----------------------------------------------------------------------
+      - alert: HighCPUUsage
+        expr: |
+          (
+            rate(container_cpu_usage_seconds_total{
+              namespace="aeromed-production",
+              container!="",
+              container!="POD"
+            }[5m])
+            /
+            on(pod, container, namespace)
+            kube_pod_container_resource_limits{resource="cpu", namespace="aeromed-production"}
+          ) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "High CPU usage: {{ $labels.container }} in {{ $labels.pod }}"
+          description: >-
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is using
+            {{ $value | humanizePercentage }} of its CPU limit for 5 minutes.
+            Consider increasing cpu.limits or triggering HPA scale-out.
+
+      # -----------------------------------------------------------------------
+      # 7. MemoryPressure
+      # memory_usage / memory_limit > 85% — close to OOMKill threshold
+      # -----------------------------------------------------------------------
+      - alert: MemoryPressure
+        expr: |
+          (
+            container_memory_usage_bytes{
+              namespace="aeromed-production",
+              container!="",
+              container!="POD"
+            }
+            /
+            on(pod, container, namespace)
+            kube_pod_container_resource_limits{resource="memory", namespace="aeromed-production"}
+          ) > 0.85
+        for: 3m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Memory pressure: {{ $labels.container }} at {{ $value | humanizePercentage }}"
+          description: >-
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is using
+            {{ $value | humanizePercentage }} of its memory limit.
+            OOMKill risk if this continues — pod will be restarted automatically
+            but will cause a brief service interruption.
+
+      # -----------------------------------------------------------------------
+      # ContainerOOMKilled — fired after the fact (memory limit was hit)
+      # -----------------------------------------------------------------------
+      - alert: ContainerOOMKilled
+        expr: |
+          kube_pod_container_status_last_terminated_reason{
+            namespace="aeromed-production",
+            reason="OOMKilled"
+          } == 1
+        for: 0m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+        annotations:
+          summary: "Container OOMKilled: {{ $labels.container }}"
+          description: >-
+            Container {{ $labels.container }} in pod {{ $labels.pod }} was killed
+            due to out-of-memory. Increase memory.limits or investigate memory leak.
+
+  # ===========================================================================
+  # Group 6 — Kubernetes Workload Health
+  # ===========================================================================
+  - name: aeromed.kubernetes.workloads
+    interval: 30s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # 5. PodRestarting
+      # Rate of restarts > 0 means pods are crashing; 2m for: avoids alert
+      # on the single restart during initial container startup.
+      # -----------------------------------------------------------------------
+      - alert: PodRestarting
+        expr: |
+          rate(kube_pod_container_status_restarts_total{
+            namespace="aeromed-production"
+          }[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Pod restarting: {{ $labels.pod }}"
+          description: >-
+            Pod {{ $labels.pod }} (container: {{ $labels.container }}) in namespace
+            {{ $labels.namespace }} has been restarting for 2 minutes.
+            Restart rate: {{ $value | humanize }}/s. Check logs:
+            kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous
+
+      # -----------------------------------------------------------------------
+      # 9. HPAMaxReplicasReached
+      # When current == max, autoscaling cannot add more capacity.
+      # Platform is at ceiling — manual intervention needed.
+      # -----------------------------------------------------------------------
+      - alert: HPAMaxReplicasReached
+        expr: |
+          kube_horizontalpodautoscaler_status_current_replicas{
+            namespace="aeromed-production"
+          }
+          ==
+          kube_horizontalpodautoscaler_spec_max_replicas{
+            namespace="aeromed-production"
+          }
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "{{ $labels.horizontalpodautoscaler }} at maximum capacity"
+          description: >-
+            HPA {{ $labels.horizontalpodautoscaler }} in {{ $labels.namespace }}
+            has been at its maximum of {{ $value }} replicas for 5 minutes.
+            The autoscaler cannot add more pods. Options:
+            1. Increase maxReplicas in kubernetes/hpa/hpa-all-services.yaml
+            2. Increase node group size via Terraform (modules/eks-cluster)
+            3. Investigate why load is not decreasing

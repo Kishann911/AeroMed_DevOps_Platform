@@ -1,0 +1,143 @@
+# =============================================================================
+# AeroMed — Emergency Dispatch Service Deployment
+# Manages P1/P2/P3 dispatch events, response times, aircraft assignments
+# =============================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: emergency-dispatch
+  namespace: aeromed-production
+  labels:
+    app: emergency-dispatch
+    tier: backend
+    criticality: high
+    app.kubernetes.io/name: emergency-dispatch
+    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/component: microservice
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    description: "Coordinates emergency dispatch — any downtime directly delays P1 responses"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: emergency-dispatch
+      tier: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # Zero downtime — P1 dispatch latency is life-critical
+  template:
+    metadata:
+      labels:
+        app: emergency-dispatch
+        tier: backend
+        criticality: high
+        app.kubernetes.io/name: emergency-dispatch
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "5004"
+    spec:
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - emergency-dispatch
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: emergency-dispatch
+          image: aeromed/emergency-dispatch:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 5004
+              protocol: TCP
+          env:
+            - name: SERVICE_NAME
+              value: "emergency-dispatch"
+            - name: PORT
+              value: "5004"
+            - name: ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          envFrom:
+            - configMapRef:
+                name: aeromed-config
+            - secretRef:
+                name: aeromed-secrets
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: emergency-dispatch

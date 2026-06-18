@@ -1,0 +1,373 @@
+# =============================================================================
+# AeroMed — Kubernetes Infrastructure Alert Rules
+#
+# These alerts fire on the underlying cluster infrastructure (nodes, control
+# plane, PVs, networking) rather than on AeroMed application behaviour.
+# Application-level alerts live in aeromed-alerts.yml.
+#
+# Targeting namespace="aeromed-production" where applicable to avoid noise
+# from kube-system workloads.
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  # Group 1 — Node Health
+  # A node failure affects ALL pods scheduled on it, including critical services
+  # ===========================================================================
+  - name: kubernetes.nodes
+    interval: 30s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # NodeNotReady
+      # kubelet has stopped reporting Ready for > 2 minutes.
+      # Pods on this node will be evicted after tolerationSeconds (default 5m).
+      # -----------------------------------------------------------------------
+      - alert: NodeNotReady
+        expr: kube_node_status_condition{condition="Ready", status="true"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+          runbook:  "https://wiki.aeromed.internal/runbooks/node-not-ready"
+        annotations:
+          summary: "Kubernetes node {{ $labels.node }} is NOT Ready"
+          description: >-
+            Node {{ $labels.node }} has been in NotReady state for 2 minutes.
+            All aeromed-production pods on this node are at risk of eviction.
+            Check: kubectl describe node {{ $labels.node }}
+            Impact: Potential reduction in pod count — may trigger HPA scale-out
+            on remaining nodes, which increases their load.
+
+      # -----------------------------------------------------------------------
+      # NodeMemoryPressure — kubelet is reporting MemoryPressure condition
+      # -----------------------------------------------------------------------
+      - alert: NodeMemoryPressure
+        expr: kube_node_status_condition{condition="MemoryPressure", status="true"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+        annotations:
+          summary: "Node {{ $labels.node }} is under memory pressure"
+          description: >-
+            Node {{ $labels.node }} has MemoryPressure=True. The kubelet may start
+            evicting pods to reclaim memory. aeromed-production pods could be
+            affected — monitor for OOMKilled containers.
+
+      # -----------------------------------------------------------------------
+      # NodeDiskPressure
+      # -----------------------------------------------------------------------
+      - alert: NodeDiskPressure
+        expr: kube_node_status_condition{condition="DiskPressure", status="true"} == 1
+        for: 1m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Node {{ $labels.node }} disk pressure"
+          description: >-
+            Node {{ $labels.node }} has DiskPressure=True.
+            Risk: kubelet may evict pods; container image pulls may fail.
+            Check: df -h on the node; review /var/log and /var/lib/docker usage.
+
+      # -----------------------------------------------------------------------
+      # NodePIDPressure
+      # -----------------------------------------------------------------------
+      - alert: NodePIDPressure
+        expr: kube_node_status_condition{condition="PIDPressure", status="true"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+        annotations:
+          summary: "Node {{ $labels.node }} PID pressure — fork bomb risk"
+          description: >-
+            Node {{ $labels.node }} has PIDPressure=True.
+            Process limit is nearly exhausted — new containers may fail to start.
+
+      # -----------------------------------------------------------------------
+      # NodeHighCPU
+      # -----------------------------------------------------------------------
+      - alert: NodeHighCPU
+        expr: |
+          (
+            1 - avg by (node) (
+              rate(node_cpu_seconds_total{mode="idle"}[5m])
+            )
+          ) > 0.90
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Node {{ $labels.node }} CPU > 90%"
+          description: >-
+            Node {{ $labels.node }} CPU utilisation: {{ $value | humanizePercentage }}
+            for 5 minutes. Consider adding nodes via Terraform (modules/eks-cluster).
+
+      # -----------------------------------------------------------------------
+      # NodeHighMemory
+      # -----------------------------------------------------------------------
+      - alert: NodeHighMemory
+        expr: |
+          (
+            node_memory_MemAvailable_bytes
+            /
+            node_memory_MemTotal_bytes
+          ) < 0.10
+        for: 3m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Node {{ $labels.instance }} memory < 10% free"
+          description: >-
+            Available memory on {{ $labels.instance }}: {{ $value | humanizePercentage }}
+            of total. Risk of OOMKill on running containers.
+
+      # -----------------------------------------------------------------------
+      # NodeFilesystemAlmostFull
+      # -----------------------------------------------------------------------
+      - alert: NodeFilesystemAlmostFull
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|fuse.lxcfs"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|fuse.lxcfs"}
+          ) < 0.10
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Node {{ $labels.instance }} filesystem {{ $labels.mountpoint }} < 10% free"
+          description: >-
+            Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} has
+            {{ $value | humanizePercentage }} space remaining.
+
+  # ===========================================================================
+  # Group 2 — Deployment Health
+  # ===========================================================================
+  - name: kubernetes.deployments
+    interval: 30s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # DeploymentReplicasMismatch
+      # Desired replicas != ready replicas for more than 5 minutes indicates
+      # a stuck rollout, image pull failure, or scheduling pressure.
+      # -----------------------------------------------------------------------
+      - alert: DeploymentReplicasMismatch
+        expr: |
+          kube_deployment_spec_replicas{namespace="aeromed-production"}
+          !=
+          kube_deployment_status_replicas_ready{namespace="aeromed-production"}
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} replicas mismatch"
+          description: >-
+            Deployment {{ $labels.deployment }} in {{ $labels.namespace }}:
+            desired={{ $labels.desired }}, ready={{ $value }}.
+            Check: kubectl rollout status deployment/{{ $labels.deployment }} -n {{ $labels.namespace }}
+            and: kubectl describe deployment/{{ $labels.deployment }} -n {{ $labels.namespace }}
+
+      # -----------------------------------------------------------------------
+      # DeploymentUnavailable — zero ready replicas (service completely down)
+      # -----------------------------------------------------------------------
+      - alert: DeploymentUnavailable
+        expr: |
+          kube_deployment_status_replicas_ready{namespace="aeromed-production"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} has ZERO ready replicas"
+          description: >-
+            Deployment {{ $labels.deployment }} in {{ $labels.namespace }} has
+            NO ready pods. The service is completely unavailable.
+            This is a zero-replica state — check for CrashLoopBackOff:
+            kubectl get pods -n {{ $labels.namespace }} -l app={{ $labels.deployment }}
+
+      # -----------------------------------------------------------------------
+      # DeploymentRolloutStuck
+      # A rolling update started but hasn't completed after 10 minutes.
+      # -----------------------------------------------------------------------
+      - alert: DeploymentRolloutStuck
+        expr: |
+          kube_deployment_status_observed_generation{namespace="aeromed-production"}
+          !=
+          kube_deployment_metadata_generation{namespace="aeromed-production"}
+        for: 10m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} rollout stuck"
+          description: >-
+            Deployment {{ $labels.deployment }} observed generation ({{ $value }})
+            does not match the desired generation. Rollout may be stuck.
+            Check: kubectl rollout status deployment/{{ $labels.deployment }} -n {{ $labels.namespace }}
+
+  # ===========================================================================
+  # Group 3 — Pod Health
+  # ===========================================================================
+  - name: kubernetes.pods
+    interval: 30s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # PodCrashLoopBackOff
+      # -----------------------------------------------------------------------
+      - alert: PodCrashLoopBackOff
+        expr: |
+          kube_pod_container_status_waiting_reason{
+            namespace="aeromed-production",
+            reason="CrashLoopBackOff"
+          } == 1
+        for: 2m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+        annotations:
+          summary: "CrashLoopBackOff: {{ $labels.container }} in {{ $labels.pod }}"
+          description: >-
+            Container {{ $labels.container }} in pod {{ $labels.pod }}
+            (namespace: {{ $labels.namespace }}) is in CrashLoopBackOff.
+            Previous logs: kubectl logs {{ $labels.pod }} -n {{ $labels.namespace }} --previous
+            Container describe: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+
+      # -----------------------------------------------------------------------
+      # PodImagePullFailed
+      # -----------------------------------------------------------------------
+      - alert: PodImagePullFailed
+        expr: |
+          kube_pod_container_status_waiting_reason{
+            namespace="aeromed-production",
+            reason=~"ImagePullBackOff|ErrImagePull"
+          } == 1
+        for: 2m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Image pull failed: {{ $labels.container }} in {{ $labels.pod }}"
+          description: >-
+            Container {{ $labels.container }} cannot pull its image.
+            Reason: {{ $labels.reason }}.
+            Check registry credentials and image tag:
+            kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+
+      # -----------------------------------------------------------------------
+      # PodNotScheduled
+      # Pending for > 5 minutes = insufficient resources or taints blocking placement
+      # -----------------------------------------------------------------------
+      - alert: PodNotScheduled
+        expr: |
+          kube_pod_status_phase{
+            namespace="aeromed-production",
+            phase="Pending"
+          } == 1
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Pod {{ $labels.pod }} stuck in Pending for 5m"
+          description: >-
+            Pod {{ $labels.pod }} in {{ $labels.namespace }} cannot be scheduled.
+            Possible causes: insufficient CPU/memory on nodes, PVC not bound,
+            node selector / affinity not matched, resource quota exceeded.
+            Check: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+
+  # ===========================================================================
+  # Group 4 — PersistentVolume Health
+  # ===========================================================================
+  - name: kubernetes.storage
+    interval: 60s
+
+    rules:
+
+      - alert: PersistentVolumeClaimPending
+        expr: |
+          kube_persistentvolumeclaim_status_phase{
+            namespace="aeromed-production",
+            phase="Pending"
+          } == 1
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "PVC {{ $labels.persistentvolumeclaim }} stuck Pending"
+          description: >-
+            PersistentVolumeClaim {{ $labels.persistentvolumeclaim }} in
+            {{ $labels.namespace }} has been in Pending state for 5 minutes.
+            No PV is available to bind it. Check StorageClass availability
+            and EBS CSI driver status.
+
+      - alert: PersistentVolumeFailed
+        expr: |
+          kube_persistentvolume_status_phase{phase="Failed"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+        annotations:
+          summary: "PersistentVolume {{ $labels.persistentvolume }} failed"
+          description: >-
+            PV {{ $labels.persistentvolume }} has entered Failed state.
+            Data may be at risk. Immediate investigation required.
+
+  # ===========================================================================
+  # Group 5 — Kubernetes Control Plane
+  # ===========================================================================
+  - name: kubernetes.controlplane
+    interval: 60s
+
+    rules:
+
+      # -----------------------------------------------------------------------
+      # KubeAPIServerDown
+      # If we can't scrape the API server, we've likely lost kubectl access.
+      # -----------------------------------------------------------------------
+      - alert: KubeAPIServerDown
+        expr: absent(up{job="kubernetes-apiservers"}) OR up{job="kubernetes-apiservers"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team:     aeromed-ops
+        annotations:
+          summary: "Kubernetes API server is unreachable"
+          description: >-
+            Prometheus cannot reach the Kubernetes API server.
+            kubectl commands will fail. All rolling deployments are stalled.
+            Check EKS control plane status in AWS console or via:
+            aws eks describe-cluster --name aeromed-production-eks --region us-east-1
+
+      # -----------------------------------------------------------------------
+      # TooManyOpenFileDescriptors (kubelet)
+      # -----------------------------------------------------------------------
+      - alert: KubeletTooManyOpenFiles
+        expr: |
+          process_open_fds{job="kubernetes-nodes"}
+          /
+          process_max_fds{job="kubernetes-nodes"} > 0.80
+        for: 5m
+        labels:
+          severity: warning
+          team:     aeromed-ops
+        annotations:
+          summary: "Kubelet {{ $labels.node }} approaching file descriptor limit"
+          description: >-
+            Kubelet on {{ $labels.node }} is using {{ $value | humanizePercentage }}
+            of its file descriptor limit. Approaching exhaustion can cause
+            pod scheduling failures.

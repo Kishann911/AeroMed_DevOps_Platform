@@ -1,0 +1,257 @@
+# =============================================================================
+# AeroMed — Recording Rules
+#
+# Recording rules pre-compute expensive queries and store them as new time series.
+# Benefits:
+#   1. Dashboard queries are instant (read pre-aggregated series, not raw metrics)
+#   2. Alerting rules can use pre-computed values instead of re-evaluating heavy
+#      expressions on every evaluation cycle
+#   3. Reduces query load on Prometheus at peak times (e.g. during incidents)
+#
+# Naming convention: <namespace>:<metric>:<aggregation>
+#   namespace  = aeromed (platform), aeromed_svc (per-service), k8s (infra)
+#   metric     = what is being measured
+#   aggregation= window or function (5m, 1h, rate, ratio, etc.)
+# =============================================================================
+
+groups:
+
+  # ===========================================================================
+  # Group 1 — Platform-wide Request Metrics
+  # Aggregated across all aeromed-* jobs
+  # ===========================================================================
+  - name: aeromed.requests
+    interval: 15s
+
+    rules:
+
+      # Requests per second (5m window) — per service
+      - record: aeromed:requests_per_second
+        expr: rate(requests_total{job=~"aeromed-.*"}[5m])
+
+      # Requests per second aggregated across the entire platform
+      - record: aeromed:requests_per_second:platform_total
+        expr: sum(rate(requests_total{job=~"aeromed-.*"}[5m]))
+
+      # HTTP 5xx error rate — per service
+      - record: aeromed:error_rate
+        expr: |
+          rate(requests_total{job=~"aeromed-.*", status=~"5.."}[5m])
+
+      # Error ratio (0.0–1.0) — per service
+      - record: aeromed:error_ratio:5m
+        expr: |
+          (
+            rate(requests_total{job=~"aeromed-.*", status=~"5.."}[5m])
+            /
+            rate(requests_total{job=~"aeromed-.*"}[5m])
+          )
+
+      # Platform-wide error ratio
+      - record: aeromed:error_ratio:platform:5m
+        expr: |
+          (
+            sum(rate(requests_total{job=~"aeromed-.*", status=~"5.."}[5m]))
+            /
+            sum(rate(requests_total{job=~"aeromed-.*"}[5m]))
+          )
+
+      # Request rate by HTTP method — useful for spotting unexpected DELETE/PUT bursts
+      - record: aeromed:requests_by_method:5m
+        expr: rate(requests_total{job=~"aeromed-.*"}[5m])
+
+  # ===========================================================================
+  # Group 2 — Availability and SLO Tracking
+  # ===========================================================================
+  - name: aeromed.availability
+    interval: 30s
+
+    rules:
+
+      # ---------------------------------------------------------------------------
+      # Availability over 5 minutes (as a percentage)
+      # avg_over_time(up[5m]) gives the fraction of scrapes that succeeded.
+      # Multiply by 100 for display in Grafana panels.
+      # ---------------------------------------------------------------------------
+      - record: aeromed:availability_5m
+        expr: avg_over_time(up{job=~"aeromed-.*"}[5m]) * 100
+
+      # Availability over 1 hour — used for SLO burn rate calculations
+      - record: aeromed:availability_1h
+        expr: avg_over_time(up{job=~"aeromed-.*"}[1h]) * 100
+
+      # Availability over 24 hours — daily SLA compliance metric
+      - record: aeromed:availability_24h
+        expr: avg_over_time(up{job=~"aeromed-.*"}[24h]) * 100
+
+      # Platform-wide availability (all services must be up for this to be 100%)
+      - record: aeromed:availability_platform_5m
+        expr: min(avg_over_time(up{job=~"aeromed-.*"}[5m])) * 100
+
+      # SLO error budget burned in the last 1h (target: 99.9% uptime)
+      # Positive value = budget remaining; negative = SLO breached
+      - record: aeromed:slo_error_budget_1h
+        expr: |
+          (1 - (1 - 0.999))
+          -
+          (1 - avg_over_time(up{job=~"aeromed-.*"}[1h]))
+
+  # ===========================================================================
+  # Group 3 — Response Time Percentiles (pre-computed for Grafana panels)
+  # ===========================================================================
+  - name: aeromed.latency
+    interval: 30s
+
+    rules:
+
+      # p50 response time per service
+      - record: aeromed:response_time_p50:5m
+        expr: |
+          histogram_quantile(0.50,
+            rate(response_time_seconds_bucket{job=~"aeromed-.*"}[5m])
+          )
+
+      # p95 response time per service — primary latency SLO metric
+      - record: aeromed:response_time_p95:5m
+        expr: |
+          histogram_quantile(0.95,
+            rate(response_time_seconds_bucket{job=~"aeromed-.*"}[5m])
+          )
+
+      # p99 response time per service — tail latency (worst-case user experience)
+      - record: aeromed:response_time_p99:5m
+        expr: |
+          histogram_quantile(0.99,
+            rate(response_time_seconds_bucket{job=~"aeromed-.*"}[5m])
+          )
+
+      # Emergency dispatch p99 — separate rule for tighter SLO alerting
+      - record: aeromed:dispatch_response_time_p99:5m
+        expr: |
+          histogram_quantile(0.99,
+            rate(response_time_seconds_bucket{job="aeromed-emergency-dispatch"}[5m])
+          )
+
+      # Average response time per service
+      - record: aeromed:response_time_avg:5m
+        expr: |
+          rate(response_time_seconds_sum{job=~"aeromed-.*"}[5m])
+          /
+          rate(response_time_seconds_count{job=~"aeromed-.*"}[5m])
+
+  # ===========================================================================
+  # Group 4 — Active Connections
+  # ===========================================================================
+  - name: aeromed.connections
+    interval: 15s
+
+    rules:
+
+      # Active connections per service (gauge — not rate)
+      - record: aeromed:active_connections
+        expr: active_connections{job=~"aeromed-.*"}
+
+      # Total active connections across the platform
+      - record: aeromed:active_connections:platform_total
+        expr: sum(active_connections{job=~"aeromed-.*"})
+
+  # ===========================================================================
+  # Group 5 — Kubernetes Resource Utilisation (pre-aggregated for dashboards)
+  # ===========================================================================
+  - name: k8s.resources.aeromed
+    interval: 30s
+
+    rules:
+
+      # CPU usage rate per container (aeromed-production namespace)
+      - record: k8s:container_cpu_usage_rate:5m
+        expr: |
+          rate(container_cpu_usage_seconds_total{
+            namespace="aeromed-production",
+            container!="",
+            container!="POD"
+          }[5m])
+
+      # CPU usage as a percentage of the limit per container
+      - record: k8s:container_cpu_usage_pct:5m
+        expr: |
+          (
+            rate(container_cpu_usage_seconds_total{
+              namespace="aeromed-production",
+              container!="",
+              container!="POD"
+            }[5m])
+            /
+            on(pod, container, namespace)
+            kube_pod_container_resource_limits{resource="cpu", namespace="aeromed-production"}
+          ) * 100
+
+      # Memory usage as a percentage of the limit per container
+      - record: k8s:container_memory_usage_pct
+        expr: |
+          (
+            container_memory_usage_bytes{
+              namespace="aeromed-production",
+              container!="",
+              container!="POD"
+            }
+            /
+            on(pod, container, namespace)
+            kube_pod_container_resource_limits{resource="memory", namespace="aeromed-production"}
+          ) * 100
+
+      # Number of ready pods per deployment
+      - record: k8s:deployment_ready_replicas
+        expr: |
+          kube_deployment_status_replicas_ready{namespace="aeromed-production"}
+
+      # Deployment availability ratio (ready / desired)
+      - record: k8s:deployment_availability_ratio
+        expr: |
+          kube_deployment_status_replicas_ready{namespace="aeromed-production"}
+          /
+          kube_deployment_spec_replicas{namespace="aeromed-production"}
+
+      # Namespace-level total CPU requested
+      - record: k8s:namespace_cpu_requested:total
+        expr: |
+          sum by (namespace) (
+            kube_pod_container_resource_requests{
+              resource="cpu",
+              namespace="aeromed-production"
+            }
+          )
+
+      # Namespace-level total memory requested
+      - record: k8s:namespace_memory_requested:total
+        expr: |
+          sum by (namespace) (
+            kube_pod_container_resource_requests{
+              resource="memory",
+              namespace="aeromed-production"
+            }
+          )
+
+  # ===========================================================================
+  # Group 6 — Emergency Dispatch Domain Metrics
+  # Pre-computed for the AeroMed Operations Dashboard
+  # ===========================================================================
+  - name: aeromed.dispatch.domain
+    interval: 15s
+
+    rules:
+
+      # Active P1 dispatches (pulled from custom gauge exposed by the service)
+      - record: aeromed:dispatch_p1_active
+        expr: aeromed_emergency_dispatch_p1_count{job="aeromed-emergency-dispatch"}
+
+      # Total active dispatches
+      - record: aeromed:dispatch_active_total
+        expr: aeromed_emergency_dispatch_active_total{job="aeromed-emergency-dispatch"}
+
+      # Aircraft with strong signal (ratio of fleet)
+      - record: aeromed:aircraft_signal_strong_ratio
+        expr: |
+          count(aeromed_aircraft_signal_strength{job="aeromed-aircraft-comms"} == 2)
+          /
+          count(aeromed_aircraft_signal_strength{job="aeromed-aircraft-comms"})

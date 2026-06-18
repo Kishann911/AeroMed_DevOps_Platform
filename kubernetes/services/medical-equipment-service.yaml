@@ -1,0 +1,36 @@
+# =============================================================================
+# AeroMed — Medical Equipment Service (ClusterIP)
+# Internal-only — equipment inventory consumed by dispatch and gateway
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: medical-equipment
+  namespace: aeromed-production
+  labels:
+    app: medical-equipment
+    tier: backend
+    criticality: high
+    app.kubernetes.io/name: medical-equipment
+    app.kubernetes.io/component: microservice
+    app.kubernetes.io/part-of: aeromed-platform
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: "/metrics"
+    prometheus.io/port: "5003"
+    description: "Internal ClusterIP service for life-critical equipment tracking"
+spec:
+  type: ClusterIP
+  selector:
+    app: medical-equipment
+    tier: backend
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+  ports:
+    - name: http
+      port: 5003
+      targetPort: http
+      protocol: TCP

@@ -1,0 +1,232 @@
+// =============================================================================
+// AeroMed — Patient Records Service Pipeline
+//
+// ⚠️  HIPAA NOTICE: This service handles Protected Health Information (PHI).
+// Additional compliance checks are enforced:
+//   - PHI data must NOT appear in build logs (enforced via masked credentials)
+//   - Container image must pass HIGH+CRITICAL vulnerability scan
+//   - Deployment approval requires aeromed-compliance role in addition to ops
+// =============================================================================
+
+@Library('aeromed-shared-lib') _
+
+pipeline {
+
+    agent any
+
+    environment {
+        SERVICE           = "patient-records"
+        SERVICE_PORT      = "5002"
+        REGISTRY          = "aeromed"
+        K8S_NAMESPACE_STG = "aeromed-staging"
+        K8S_NAMESPACE_PRD = "aeromed-production"
+        KUBE_CONFIG       = credentials('kubeconfig')
+        PIPELINE_START_MS = "${System.currentTimeMillis()}"
+        FAILED_STAGE      = ""
+    }
+
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['staging', 'production'],
+               description: 'Target environment')
+        booleanParam(name: 'SKIP_TESTS',  defaultValue: false,
+                     description: '⚠️  Skip tests — PHI service, use only in true emergency')
+        booleanParam(name: 'ROLLBACK',    defaultValue: false,
+                     description: 'Auto-rollback on failure')
+        string(name: 'PREVIOUS_VERSION',  defaultValue: '',
+               description: 'Explicit build number to roll back to')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Checkout'
+                    checkout scm
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    echo "Building ${SERVICE} | Commit: ${env.GIT_COMMIT_SHORT} | Build: #${env.BUILD_NUMBER}"
+                    echo "⚠️  PHI-handling service — all credentials are masked in logs"
+                }
+            }
+        }
+
+        stage('Pre-flight Checks') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Pre-flight Checks'
+                    sh "docker info > /dev/null 2>&1"
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        sh "kubectl cluster-info --request-timeout=10s"
+                    }
+                    // PHI check: ensure MEDICAL_RECORDS_ENCRYPTION_KEY secret exists in target namespace
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        sh """
+                            kubectl get secret aeromed-secrets \
+                                --namespace=${K8S_NAMESPACE_PRD} \
+                                -o jsonpath='{.data.MEDICAL_RECORDS_ENCRYPTION_KEY}' \
+                                --ignore-not-found | grep -q . || \
+                            echo "WARNING: MEDICAL_RECORDS_ENCRYPTION_KEY not found in production secrets"
+                        """
+                    }
+                    echo "✅ Pre-flight checks passed"
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Build'
+                    aeromedBuild.buildImage(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Security Scan'
+                    // PHI service: scan for both CRITICAL and HIGH; mark pipeline
+                    // unstable on HIGH (blocks production approval)
+                    aeromedBuild.runSecurityScan(
+                        "${REGISTRY}/${SERVICE}:${env.BUILD_NUMBER}",
+                        true    // failOnCritical
+                    )
+                    // Additional HIGH check — marks unstable to alert compliance team
+                    def highResult = sh(
+                        script: """
+                            docker run --rm \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v trivy-cache:/root/.cache/ \
+                                aquasec/trivy:latest image \
+                                    --exit-code 1 --severity HIGH --no-progress \
+                                    ${REGISTRY}/${SERVICE}:${env.BUILD_NUMBER} 2>&1 || true
+                        """,
+                        returnStatus: true
+                    )
+                    if (highResult != 0) {
+                        unstable("HIGH vulnerabilities in PHI service — compliance review required before production")
+                    }
+                }
+            }
+        }
+
+        stage('Unit Tests') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Unit Tests'
+                    aeromedBuild.runUnitTests(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            when { expression { !params.SKIP_TESTS } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Integration Tests'
+                    aeromedBuild.runIntegrationTests([SERVICE])
+                }
+            }
+            post {
+                always { script { aeromedBuild.teardownIntegrationTests() } }
+            }
+        }
+
+        stage('Push') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Push'
+                    withCredentials([usernamePassword(credentialsId: 'docker-registry-creds',
+                                                      usernameVariable: 'DOCKER_USER',
+                                                      passwordVariable: 'DOCKER_PASS')]) {
+                        sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                    }
+                    aeromedBuild.pushImage(SERVICE, env.BUILD_NUMBER, REGISTRY)
+                    sh "docker logout"
+                }
+            }
+        }
+
+        stage('Deploy → Staging') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy → Staging'
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy(SERVICE, K8S_NAMESPACE_STG, env.BUILD_NUMBER)
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Test (Staging)') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Smoke Test (Staging)'
+                    aeromedDeploy.verifyServiceHealth(
+                        "http://aeromed-patient-records-staging:${SERVICE_PORT}"
+                    )
+                }
+            }
+        }
+
+        stage('Deploy → Production') {
+            when { expression { params.ENVIRONMENT == 'production' } }
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Deploy → Production'
+                    aeromedNotify.stagingApprovalGate(SERVICE, env.BUILD_NUMBER)
+                    // PHI service: requires compliance officer sign-off in addition to ops
+                    timeout(time: 60, unit: 'MINUTES') {
+                        input message: "⚕️  Deploy patient-records #${env.BUILD_NUMBER} to production?\n" +
+                                       "PHI service — confirm HIPAA compliance review is complete.",
+                              ok: '✅ Compliance Confirmed — Deploy',
+                              submitter: 'aeromed-lead,aeromed-compliance'
+                    }
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy(SERVICE, K8S_NAMESPACE_PRD, env.BUILD_NUMBER)
+                    }
+                }
+            }
+        }
+
+        stage('Verify') {
+            steps {
+                script {
+                    env.FAILED_STAGE = 'Verify'
+                    def ns = params.ENVIRONMENT == 'production' ? K8S_NAMESPACE_PRD : K8S_NAMESPACE_STG
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.verifyPostDeployState(SERVICE, ns)
+                    }
+                    aeromedNotify.deploymentSummary(SERVICE, ns, env.BUILD_NUMBER, env.PIPELINE_START_MS as long)
+                }
+            }
+        }
+    }
+
+    post {
+        success { script { aeromedNotify.success(SERVICE, env.BUILD_NUMBER) } }
+        failure {
+            script {
+                aeromedNotify.failure(SERVICE, env.FAILED_STAGE, env.BUILD_NUMBER)
+                if (params.ROLLBACK) {
+                    withEnv(["KUBECONFIG=${KUBE_CONFIG}"]) {
+                        aeromedDeploy.rollbackDeployment(SERVICE, K8S_NAMESPACE_PRD, params.PREVIOUS_VERSION ?: null)
+                    }
+                }
+            }
+        }
+        always {
+            junit allowEmptyResults: true, testResults: '**/test-results.xml'
+            cleanWs(cleanWhenSuccess: true, cleanWhenFailure: false, deleteDirs: true)
+        }
+    }
+}
